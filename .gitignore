@@ -1,0 +1,11 @@
+.venv/
+sweeps/
+__pycache__/
+*.pyc
+.env
+.cache/
+_backups/
+_to_delete/
+pipeline/sweep_samples/
+*.mp4
+.DS_Store
