@@ -39,7 +39,7 @@ from PIL import Image
 
 from .catalog import _found, _with_joins, significant, tokens
 from .common import pick_device, read_json, write_json
-from .spine_ocr import group_strips, to_original
+from .spine_ocr import LYING_FLAT, group_strips, to_original
 from .telemetry import stage
 
 SAM_ID = "facebook/sam-vit-base"
@@ -58,7 +58,7 @@ MIN_OCR_CONFIDENCE = 0.5
 class Spine:
     frame_ref: str
     text: str
-    orientation: str                     # OCR reading direction: "horizontal" means the book lies flat
+    orientation: str                     # OCR reading direction: "horizontal" or "upside_down" means the book lies flat
     length_px: float
     thickness_px: float
     centre: tuple[float, float]
@@ -73,7 +73,7 @@ class Spine:
 
     @property
     def upright(self) -> bool:
-        return self.orientation != "horizontal"
+        return self.orientation not in LYING_FLAT
 
 
 # ---- geometry --------------------------------------------------------------------------------
@@ -206,7 +206,7 @@ def segment_spines(segmenter: Segmenter, strips: list[dict], frame_ref: str, fra
     for strip in strips:
         x0, y0, x1, y1 = strip["box"]
         cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        along = [(x0 + (x1 - x0) * f, cy) for f in (0.25, 0.5, 0.75)] if strip["orientation"] == "horizontal" \
+        along = [(x0 + (x1 - x0) * f, cy) for f in (0.25, 0.5, 0.75)] if strip["orientation"] in LYING_FLAT \
             else [(cx, y0 + (y1 - y0) * f) for f in (0.25, 0.5, 0.75)]
         best = None
         for mask, score in segmenter.masks(points=[list(p) for p in along]):

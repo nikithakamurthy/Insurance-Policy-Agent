@@ -1,9 +1,10 @@
 """Book agent, step 1: read spine text from the spine frames (docTR OCR).
 
-Spines carry text in three directions: horizontal (books lying flat), top-to-bottom (common
-for English-language spines) and bottom-to-top (common for German and French spines). Each
-frame is read three times: upright, rotated 90 degrees counter-clockwise, and clockwise. The
-wrong rotation produces mirrored gibberish, which the catalogue match later rejects.
+Spines carry text in four directions: horizontal (books lying flat), top-to-bottom (common
+for English-language spines), bottom-to-top (common for German and French spines) and upside
+down (a book lying flat the other way round, or held upside down). Each frame is read four
+times: upright, rotated 90 degrees counter-clockwise, clockwise, and 180 degrees. The wrong
+rotation produces mirrored gibberish, which the catalogue match later rejects.
 
 Within one reading, a spine is a horizontal strip, so text lines sitting end to end on the
 same strip belong to the same spine. Each strip, and each pair of neighbouring strips (title
@@ -21,7 +22,9 @@ ORIENTATIONS = {
     "horizontal": None,
     "top_to_bottom": Image.Transpose.ROTATE_90,     # counter-clockwise: top-to-bottom text becomes left-to-right
     "bottom_to_top": Image.Transpose.ROTATE_270,    # clockwise
+    "upside_down": Image.Transpose.ROTATE_180,
 }
+LYING_FLAT = {"horizontal", "upside_down"}          # text runs along the frame's width: the book lies flat
 
 
 def to_original(box: tuple[float, float, float, float], orientation: str) -> list[float]:
@@ -31,6 +34,8 @@ def to_original(box: tuple[float, float, float, float], orientation: str) -> lis
         return [1 - y1, x0, 1 - y0, x1]
     if orientation == "bottom_to_top":      # rotated (x', y') = (1 - y, x)
         return [y0, 1 - x1, y1, 1 - x0]
+    if orientation == "upside_down":        # rotated (x', y') = (1 - x, 1 - y)
+        return [1 - x1, 1 - y1, 1 - x0, 1 - y0]
     return [x0, y0, x1, y1]
 
 
@@ -90,8 +95,8 @@ class SpineReader:
 
         self.model = ocr_predictor(det_arch="db_resnet50", reco_arch="parseq", pretrained=True,
                                    assume_straight_pages=True, detect_orientation=False)
-        # On the GPU: 0.92 s per frame (three orientations) instead of 2.98 s on the CPU (M5),
-        # with identical readings. Live sweeps need this to keep up with the camera.
+        # On the GPU: 0.92 s per frame for three orientations (about 1.2 s for four) instead of
+        # 2.98 s for three on the CPU (M5), with identical readings. Live sweeps need the GPU.
         self.model = self.model.to(pick_device(device))
         self.min_word_conf = min_word_conf
 

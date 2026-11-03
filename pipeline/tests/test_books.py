@@ -22,6 +22,11 @@ class SpineGeometryTest(unittest.TestCase):
             for g, w in zip(got, want):
                 self.assertAlmostEqual(g, w)
 
+    def test_upside_down_box_maps_back(self):
+        # A box at the top-left of the frame is at the bottom-right of the 180-degree view.
+        for g, w in zip(to_original((0.8, 0.9, 1.0, 1.0), "upside_down"), [0.0, 0.0, 0.2, 0.1]):
+            self.assertAlmostEqual(g, w)
+
     def test_lines_on_one_strip_group_together(self):
         lines = [{"text": "ERIC RIES", "box": (0.6, 0.30, 0.9, 0.34)},
                  {"text": "THE LEAN STARTUP", "box": (0.1, 0.30, 0.5, 0.35)},

@@ -138,5 +138,13 @@ class ClosestThicknessTest(unittest.TestCase):
         self.assertEqual(measure.closest_thickness(values), 2.0)
 
 
+
+
+class OrientationTest(unittest.TestCase):
+    def test_upside_down_text_means_the_book_lies_flat(self):
+        flat = spine("x", rect_mask(100, 100, 500, 160), orientation="upside_down")
+        self.assertFalse(flat.upright)
+
+
 if __name__ == "__main__":
     unittest.main()
