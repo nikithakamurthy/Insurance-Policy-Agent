@@ -1,5 +1,6 @@
 import unittest
 
+import cv2
 import numpy as np
 
 from pipeline import measure
@@ -144,6 +145,49 @@ class OrientationTest(unittest.TestCase):
     def test_upside_down_text_means_the_book_lies_flat(self):
         flat = spine("x", rect_mask(100, 100, 500, 160), orientation="upside_down")
         self.assertFalse(flat.upright)
+
+    def test_slant_of_the_text_decides_over_the_reading_direction(self):
+        # A spine leaning 27 degrees, read in the as-taken pass: its text runs mostly up the frame.
+        lean = np.deg2rad(90 - 27)
+        dx, dy, nx, ny = np.cos(lean) * 0.3, -np.sin(lean) * 0.3, np.sin(lean) * 0.02, np.cos(lean) * 0.02
+        poly = [[0.5, 0.8], [0.5 + dx, 0.8 + dy], [0.5 + dx + nx, 0.8 + dy + ny], [0.5 + nx, 0.8 + ny]]
+        line = {"text": "Designing Machine Learning", "box": [0.5, 0.5, 0.65, 0.82], "confidence": 0.99, "poly": poly}
+        strip = measure.text_strips({"horizontal": [line]}, 1000, 1000)[0]
+        self.assertFalse(strip["flat"])
+        points, _ = measure._prompt_points(strip)
+        (x0, y0), (x2, y2) = points[0], points[2]
+        self.assertAlmostEqual(abs(np.degrees(np.arctan2(abs(y2 - y0), abs(x2 - x0)))), 90 - 27, delta=1)
+        standing = spine("x", rect_mask(100, 100, 160, 500), orientation="horizontal")
+        standing.flat = strip["flat"]
+        self.assertTrue(standing.upright)
+
+    def test_thickness_ignores_a_short_spill_into_the_next_book(self):
+        mask = rect_mask(100, 100, 160, 700)            # a 60 px wide spine, 600 px long
+        mask[620:700, 160:260] = True                    # its outline leaks into the neighbour near one end
+        self.assertGreater(measure.fit_rectangle(mask)[1], 150)       # the rectangle takes the whole spill
+        self.assertAlmostEqual(measure.median_width(mask), 60, delta=2)
+
+    def test_thickness_of_a_leaning_spine(self):
+        mask = np.zeros((1080, 1920), np.uint8)
+        box = cv2.boxPoints(((960, 540), (600, 50), 63)).astype(np.int32)   # 50 px wide, leaning 27 degrees
+        cv2.fillConvexPoly(mask, box, 1)
+        self.assertAlmostEqual(measure.median_width(mask.astype(bool)), 50, delta=3)
+
+    def test_text_printed_on_the_card_is_not_a_spine(self):
+        card = rect_mask(1000, 600, 1340, 815)
+        on_card = spine("VISA", rect_mask(980, 590, 1400, 830), orientation="horizontal")
+        on_card.text_region = np.int32([[1200, 620], [1320, 620], [1320, 660], [1200, 660]])
+        real = spine("THE LEAN STARTUP", rect_mask(900, 100, 960, 700))
+        real.text_region = np.int32([[910, 150], [950, 150], [950, 600], [910, 600]])
+        self.assertTrue(measure.text_on_card(on_card, card))
+        self.assertFalse(measure.text_on_card(real, card))
+
+    def test_text_outline_inside_the_mask_counts_as_covered(self):
+        mask = rect_mask(100, 100, 160, 500).astype(bool)
+        inside = np.int32([[110, 150], [150, 150], [150, 450], [110, 450]])
+        outside = np.int32([[300, 150], [340, 150], [340, 450], [300, 450]])
+        self.assertEqual(measure._covered(mask, inside), 1.0)
+        self.assertEqual(measure._covered(mask, outside), 0.0)
 
 
 if __name__ == "__main__":

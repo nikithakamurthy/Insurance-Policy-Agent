@@ -8,7 +8,10 @@ Spines
   Each OCR text strip prompts SAM ("outline the object under these points"), so the outline
   returned is the spine that text is printed on; the title linked to the text is linked to the
   outline. A rotated rectangle fitted to the outline gives the spine's length (the book's
-  height) and width (its thickness) in pixels, upright, leaning or lying flat. Two prompts
+  height) in pixels, upright, leaning or lying flat. Its thickness is the outline's median width
+  across that length: an outline that spills into a touching book over a short stretch widens
+  the rectangle by the whole spill, but moves the median width hardly at all (on three test
+  photos the median thickness error went from 40% to 15%). Two prompts
   that outline the same spine (mirrored readings of one spine) are kept once. A spine cut off
   by the frame edge gets no height from that frame.
 
@@ -70,10 +73,12 @@ class Spine:
     book_id: str | None = None
     sides: tuple | None = None           # pixel vectors of the long and short side, for per-axis scale
     behind_card: bool = False            # the card covers part of it: no height from this frame
+    flat: bool | None = None             # from the slant of its text, when OCR gave one (overrides orientation)
+    text_region: np.ndarray | None = field(default=None, repr=False)    # pixel outline of the text it was prompted with
 
     @property
     def upright(self) -> bool:
-        return self.orientation not in LYING_FLAT
+        return not self.flat if self.flat is not None else self.orientation not in LYING_FLAT
 
 
 # ---- geometry --------------------------------------------------------------------------------
@@ -82,6 +87,21 @@ def fit_rectangle(mask: np.ndarray) -> tuple[float, float, tuple[float, float], 
     ys, xs = np.nonzero(mask)
     (cx, cy), (w, h), angle = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))
     return max(w, h), min(w, h), (cx, cy), angle
+
+
+def median_width(mask: np.ndarray) -> float:
+    """The outline's median width across its long axis, sampled at every pixel along its length."""
+    ys, xs = np.nonzero(mask)
+    (cx, cy), (w, h), angle = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))
+    a = np.deg2rad(angle if w >= h else angle + 90)
+    along_axis, across_axis = np.array([np.cos(a), np.sin(a)]), np.array([-np.sin(a), np.cos(a)])
+    points = np.column_stack([xs - cx, ys - cy]).astype(np.float32)
+    along, across = np.round(points @ along_axis).astype(int), points @ across_axis
+    order = np.argsort(along, kind="stable")
+    along, across = along[order], across[order]
+    rows = np.split(across, np.flatnonzero(np.diff(along)) + 1)
+    widths = [np.ptp(row) + 1 for row in rows if len(row) > 3]
+    return float(np.median(widths)) if widths else float(min(w, h))
 
 
 def side_vectors(mask: np.ndarray) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -195,32 +215,64 @@ def text_strips(lines_by_orientation: dict[str, list[dict]], width: int, height:
             xs0, ys0, xs1, ys1 = zip(*(l["box"] for l in strip))
             x0, y0, x1, y1 = to_original((min(xs0), min(ys0), max(xs1), max(ys1)), orientation)
             text = " ".join(l["text"] for l in strip)
-            if len(text.strip()) >= 4:
-                strips.append({"text": text, "orientation": orientation, "box": [x0 * width, y0 * height, x1 * width, y1 * height]})
+            if len(text.strip()) < 4:
+                continue
+            found = {"text": text, "orientation": orientation, "box": [x0 * width, y0 * height, x1 * width, y1 * height]}
+            if all("poly" in l for l in strip):          # rotated OCR boxes: the text's own slant
+                corners = np.float32([(x * width, y * height) for l in strip for x, y in l["poly"]])
+                (_, _), (w, h), angle = cv2.minAreaRect(corners)
+                along = np.deg2rad(angle if w >= h else angle + 90)       # direction of the text line
+                found["corners"] = corners
+                found["flat"] = abs(np.cos(along)) >= abs(np.sin(along))  # text closer to level than to vertical
+            strips.append(found)
     return strips
+
+
+def _prompt_points(strip: dict) -> tuple[list[tuple[float, float]], np.ndarray]:
+    """Three points along the text, and a mask-sized test region (box or slanted outline)."""
+    if "corners" in strip:
+        (cx, cy), (w, h), angle = cv2.minAreaRect(strip["corners"])
+        length, along = (w, np.deg2rad(angle)) if w >= h else (h, np.deg2rad(angle + 90))
+        dx, dy = np.cos(along) * length, np.sin(along) * length
+        return [(cx + dx * f, cy + dy * f) for f in (-0.25, 0, 0.25)], cv2.convexHull(strip["corners"]).astype(np.int32)
+    x0, y0, x1, y1 = strip["box"]
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    along = [(x0 + (x1 - x0) * f, cy) for f in (0.25, 0.5, 0.75)] if strip["orientation"] in LYING_FLAT \
+        else [(cx, y0 + (y1 - y0) * f) for f in (0.25, 0.5, 0.75)]
+    return along, np.int32([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+
+
+def _covered(mask: np.ndarray, region: np.ndarray) -> float:
+    """Share of the text region inside the outline."""
+    inside = np.zeros(mask.shape, np.uint8)
+    cv2.fillConvexPoly(inside, region, 1)
+    total = inside.sum()
+    return float(mask[inside.astype(bool)].mean()) if total else 0.0
 
 
 def segment_spines(segmenter: Segmenter, strips: list[dict], frame_ref: str, frame_area: int) -> list[Spine]:
     """One outline per spine, prompted with points along its text."""
     spines: list[Spine] = []
     for strip in strips:
-        x0, y0, x1, y1 = strip["box"]
-        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        along = [(x0 + (x1 - x0) * f, cy) for f in (0.25, 0.5, 0.75)] if strip["orientation"] in LYING_FLAT \
-            else [(cx, y0 + (y1 - y0) * f) for f in (0.25, 0.5, 0.75)]
+        along, region = _prompt_points(strip)
         best = None
         for mask, score in segmenter.masks(points=[list(p) for p in along]):
             if mask.sum() < 200 or mask.sum() > 0.2 * frame_area:
                 continue
-            covered = mask[int(y0):int(y1) + 1, int(x0):int(x1) + 1].mean()
+            covered = _covered(mask, region)
             length, thickness, centre, angle = fit_rectangle(mask)
             if covered < 0.6 or length / max(thickness, 1) < 2:      # must hold the text and be spine-shaped
                 continue
             if best is None or score > best.score:
                 best = Spine(frame_ref, strip["text"], strip["orientation"], length, thickness, centre, angle,
-                             touches_edge(mask), score, mask, sides=side_vectors(mask))
+                             touches_edge(mask), score, mask, sides=side_vectors(mask), flat=strip.get("flat"),
+                             text_region=region)
         if best is None:
             continue
+        width = median_width(best.mask)
+        (lx, ly), (sx, sy) = best.sides
+        norm = float(np.hypot(sx, sy)) or 1.0
+        best.thickness_px, best.sides = width, ((lx, ly), (sx / norm * width, sy / norm * width))
         twin = next((s for s in spines if mask_iou(s.mask, best.mask) > 0.5), None)
         if twin is None:
             spines.append(best)
@@ -231,12 +283,18 @@ def segment_spines(segmenter: Segmenter, strips: list[dict], frame_ref: str, fra
     return spines
 
 
+def text_on_card(spine: Spine, card_mask: np.ndarray) -> bool:
+    """The text this 'spine' was found from is printed on the card (VISA, the bank's name)."""
+    return spine.text_region is not None and _covered(card_mask, spine.text_region) >= 0.5
+
+
 def find_card(detector, segmenter: Segmenter, image: Image.Image, spines: list[Spine]) -> dict | None:
     """The reference card in a frame, or None. The outline must have a card's proportions and
-    must not be one of the spines."""
+    must not be one of the spines; a 'spine' found from the card's own printing does not count."""
     for hit in detector.find(image, CARD_PHRASES, threshold=0.3)[:3]:
         for mask, score in sorted(segmenter.masks(box=hit["box"]), key=lambda m: -m[1]):
-            if mask.sum() < 400 or touches_edge(mask) or any(mask_iou(mask, s.mask) > 0.3 for s in spines):
+            if mask.sum() < 400 or touches_edge(mask) or \
+                    any(mask_iou(mask, s.mask) > 0.3 and not text_on_card(s, mask) for s in spines):
                 continue
             long_px, short_px, centre, angle = fit_rectangle(mask)
             scale = card_scale(long_px, short_px)
@@ -338,6 +396,7 @@ class FrameMeasurer:
         with stage("measure: card (Grounding DINO + SAM)"):
             card = find_card(self.detector, self.segmenter, image, spines)
         if card:
+            spines = [s for s in spines if not text_on_card(s, card["mask"])]
             mark_behind_card(spines, card["mask"])
         with stage("measure: depth (Depth Pro)"):
             depth, focal = self.depth_model(image) if self.depth_model else (None, None)
@@ -356,16 +415,18 @@ class FrameMeasurer:
         return result
 
 
-def finish(results: list[FrameResult], books: list[dict], *, use_model: bool = True) -> dict:
+def finish(results: list[FrameResult], books: list[dict], *, use_model: bool = True, depth_correction: bool = True) -> dict:
     """Link titles, apply the scales and combine frames into one size per book. Cheap, so it is
-    rerun whenever more books are identified."""
+    rerun whenever more books are identified. depth_correction=False applies the card's and the
+    rulers' scale as is, without moving it to each spine's distance with Depth Pro's depth ratio
+    (for comparing the two)."""
     for result in results:
         result.measurements = []
         link_books(result.spines, books)     # a title is often read in one frame and identified from another
         card = result.card
         for spine in result.spines if card else []:
             # The card's scale holds at the card's distance; move it to the spine's distance.
-            ratio = card["depth_m"] / spine.depth_m if spine.depth_m and card.get("depth_m") else 1.0
+            ratio = card["depth_m"] / spine.depth_m if depth_correction and spine.depth_m and card.get("depth_m") else 1.0
             scale = (card["px_per_cm_xy"][0] * ratio, card["px_per_cm_xy"][1] * ratio) if card["px_per_cm_xy"] \
                 else card["px_per_cm"] * ratio
             result.measurements.append({"spine": spine, "method": "card", **sizes(spine, scale)})
@@ -377,7 +438,7 @@ def finish(results: list[FrameResult], books: list[dict], *, use_model: bool = T
         for spine in result.spines:
             if sweep_focal and spine.depth_m:
                 result.measurements.append({"spine": spine, "method": "model", **sizes(spine, model_scale(spine.depth_m, sweep_focal))})
-    _add_ruler_measurements(results)
+    _add_ruler_measurements(results, depth_correction)
     return _combine(results, books, use_model)
 
 
@@ -395,7 +456,7 @@ def measure_sweep(sweep_dir: Path, *, use_model: bool = True, device: str | None
     return report
 
 
-def _add_ruler_measurements(results: list[FrameResult]) -> None:
+def _add_ruler_measurements(results: list[FrameResult], depth_correction: bool = True) -> None:
     """Frames without a card: books measured with a card elsewhere set the scale."""
     card_heights: dict[str, list[float]] = {}
     for result in results:
@@ -415,7 +476,7 @@ def _add_ruler_measurements(results: list[FrameResult]) -> None:
                 if r is spine:
                     continue
                 scale = r.length_px / known[r.book_id]
-                if r.depth_m and spine.depth_m:
+                if depth_correction and r.depth_m and spine.depth_m:
                     scale *= r.depth_m / spine.depth_m
                 scales.append(scale)
             if scales:

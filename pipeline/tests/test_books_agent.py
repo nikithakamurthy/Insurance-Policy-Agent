@@ -17,9 +17,17 @@ LEAN = {"key": "/works/OL1W", "title": "The Lean Startup", "author_name": ["Eric
 OTHER = {"key": "/works/OL2W", "title": "Lean Analytics", "author_name": ["Alistair Croll"], "first_publish_year": 2013}
 
 
+CLEAR = "THE LEAN STARTUP ERIC RIES"
+# Title and author read, but merged with several neighbouring spines: the rules reject it, the model may pick.
+MERGED = "THE LEAN STARTUP ERIC RIES ZERO ONE THIEL BLISS CLUB CREATIVE LOVERS SPARK DEFINITIVE GUIDE"
+
+
 class FakeReader:
+    def __init__(self, text: str = CLEAR):
+        self.text = text
+
     def read(self, image):
-        line = {"text": "THE LEAN STARTUP ERIC RIES", "box": [0.1, 0.4, 0.9, 0.5], "confidence": 1.0}
+        line = {"text": self.text, "box": [0.1, 0.4, 0.9, 0.5], "confidence": 1.0}
         return {"horizontal": [line], "top_to_bottom": [], "bottom_to_top": []}
 
 
@@ -59,8 +67,8 @@ class BooksAgentTest(unittest.IsolatedAsyncioTestCase):
         self.priced.append(book["title"])
         return {"status": "identified", "replacement_cost": {"amount": 9.41, "currency": state["currency"]}}
 
-    async def run_with(self, matcher):
-        agent = books_agent.create_books_agent(FakeReader, self.price, matcher=matcher)
+    async def run_with(self, matcher, text: str = MERGED):
+        agent = books_agent.create_books_agent(lambda: FakeReader(text), self.price, matcher=matcher)
         return await books_agent.run_books_agent(agent, [{"ref": "f00001", "path": str(self.frame)}], "DE", "EUR")
 
     async def test_book_seen_earlier_needs_no_search_or_model_call(self):
@@ -77,9 +85,11 @@ class BooksAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["matches"]["by"], "seen earlier")
         self.assertEqual([b["title"] for b in result["verified"]["accepted"]], ["The Lean Startup"])
 
-    async def test_supported_pick_is_accepted_and_priced(self):
+    async def test_supported_model_pick_is_accepted_and_priced(self):
         result = await self.run_with(FakeMatcher(name="M", picks=[{"reading_id": 0, "work_key": "/works/OL1W", "evidence": "LEAN STARTUP RIES"}]))
+        self.assertEqual(result["matches"]["by"], f"rules+{books_agent.MODEL}")
         self.assertEqual([b["title"] for b in result["verified"]["accepted"]], ["The Lean Startup"])
+        self.assertEqual(result["verified"]["accepted"][0]["matched_by"], books_agent.MODEL)
         self.assertEqual(result["verified"]["accepted"][0]["frame_refs"], ["f00001"])
         self.assertEqual(self.priced, ["The Lean Startup"])
         self.assertEqual(result["priced"][0]["replacement_cost"]["amount"], 9.41)
@@ -93,29 +103,49 @@ class BooksAgentTest(unittest.IsolatedAsyncioTestCase):
     async def test_batch_merges_the_same_reading_across_frames(self):
         second = Path(self.tmp.name) / "f00002.jpg"
         Image.new("RGB", (64, 64)).save(second)
-        agent = books_agent.create_books_agent(FakeReader, self.price, matcher=FakeMatcher(
-            name="M", picks=[{"reading_id": 0, "work_key": "/works/OL1W", "evidence": "LEAN STARTUP RIES"}]))
+        agent = books_agent.create_books_agent(FakeReader, self.price, matcher=FakeMatcher(name="M", fail=True))
         result = await books_agent.run_books_agent(agent, [{"ref": "f00001", "path": str(self.frame)},
                                                            {"ref": "f00002", "path": str(second)}], "DE", "EUR")
         self.assertEqual(len(result["readings"]), 1)                        # same text on both frames: searched once
         self.assertEqual(result["verified"]["accepted"][0]["frame_refs"], ["f00001", "f00002"])
         self.assertEqual(sorted(result["ocr_lines"]), ["f00001", "f00002"])
 
+    async def test_same_spine_read_differently_in_two_frames_is_one_reading(self):
+        second = Path(self.tmp.name) / "f00002.jpg"
+        Image.new("RGB", (64, 64)).save(second)
+        texts = iter(["THE LEAN STARTUP ERIC RIES", "ERIC RLES THE LEAN STARTUP"])    # word order and one letter apart
+        agent = books_agent.create_books_agent(lambda: FakeReader(next(texts)), self.price, matcher=FakeMatcher(name="M", fail=True))
+        result = await books_agent.run_books_agent(agent, [{"ref": "f00001", "path": str(self.frame)},
+                                                           {"ref": "f00002", "path": str(second)}], "DE", "EUR")
+        self.assertEqual(len(result["readings"]), 1)
+        self.assertEqual(result["readings"][0]["frame_refs"], ["f00001", "f00002"])
+
+    async def test_single_strips_are_searched_before_pairs_of_strips(self):
+        class TwoStrips:
+            def read(self, image):        # two spines' lines; the pair of them would rank between them by confidence
+                return {"horizontal": [{"text": "THE LEAN STARTUP", "box": [0.1, 0.1, 0.9, 0.15], "confidence": 0.7},
+                                       {"text": "ZERO TO ONE THIEL", "box": [0.1, 0.5, 0.9, 0.55], "confidence": 1.0}]}
+        agent = books_agent.create_books_agent(TwoStrips, self.price, matcher=FakeMatcher(name="M", fail=True))
+        with patch.object(books_agent, "MAX_READINGS", 2):
+            result = await books_agent.run_books_agent(agent, [{"ref": "f00001", "path": str(self.frame)}], "DE", "EUR")
+        self.assertEqual(sorted(r["text"] for r in result["readings"]), ["THE LEAN STARTUP", "ZERO TO ONE THIEL"])
+
     async def test_rules_only_mode_makes_no_model_call(self):
         with patch.object(books_agent, "MATCHER", "rules"):
             agent = books_agent.create_books_agent(FakeReader, self.price)
-        self.assertEqual(agent.sub_agents[2].sub_agents, [])                  # no LlmAgent in the match step
+        self.assertEqual(agent.sub_agents[3].sub_agents, [])                  # no LlmAgent in the model step
         result = await books_agent.run_books_agent(agent, [{"ref": "f00001", "path": str(self.frame)}], "DE", "EUR")
         self.assertEqual(result["matches"]["by"], "rules")
         self.assertEqual([b["title"] for b in result["verified"]["accepted"]], ["The Lean Startup"])
 
     def test_default_uses_the_llm(self):
         agent = books_agent.create_books_agent(FakeReader, self.price)       # built only, never run here
-        self.assertEqual(agent.sub_agents[2].sub_agents[0].name, "MatchBooksLLM")
+        self.assertEqual(agent.sub_agents[3].sub_agents[0].name, "MatchBooksLLM")
 
-    async def test_rules_keep_their_match_when_the_model_skips_it(self):
-        result = await self.run_with(FakeMatcher(name="M", picks=[]))       # the model picked nothing
-        self.assertEqual(result["matches"]["by"], f"{books_agent.MODEL}+rules")
+    async def test_rule_match_is_accepted_without_model_or_verify(self):
+        # "leon startup": the rules accept it through the joined words; nothing re-checks it word by word.
+        result = await self.run_with(FakeMatcher(name="M", fail=True), text="LEON STARTUP ERIC RIES")   # would fail if called
+        self.assertEqual(result["matches"]["by"], "rules")
         self.assertEqual([b["title"] for b in result["verified"]["accepted"]], ["The Lean Startup"])
 
     async def test_search_failure_loses_only_that_reading(self):
@@ -145,12 +175,13 @@ class BooksAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first["matches"]["by"].startswith("rules (model failed"))
         self.assertEqual(second["matches"]["by"], "rules (model paused after quota error)")
         self.assertEqual(len(calls), 1)                                     # the paused model was not called again
-        self.assertEqual([b["title"] for b in second["verified"]["accepted"]], ["The Lean Startup"])
 
-    async def test_model_failure_falls_back_to_rules(self):
+    async def test_model_failure_adds_nothing_and_verifies_nothing(self):
         result = await self.run_with(FakeMatcher(name="M", fail=True))
-        self.assertTrue(result["matches"]["by"].startswith("rules"))
-        self.assertEqual([b["title"] for b in result["verified"]["accepted"]], ["The Lean Startup"])
+        self.assertTrue(result["matches"]["by"].startswith("rules (model failed"))
+        self.assertEqual(result["verified"]["accepted"], [])                  # the rules could not match this reading
+        self.assertEqual(result["verified"]["suggested"], [])
+        self.assertEqual(self.priced, [])
 
 
 if __name__ == "__main__":

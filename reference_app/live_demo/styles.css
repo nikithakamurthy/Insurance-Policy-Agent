@@ -474,7 +474,6 @@ h1 {
   text-transform: uppercase;
 }
 
-.needed-list,
 .team-feed {
   list-style: none;
   margin: 0;
@@ -482,56 +481,6 @@ h1 {
   display: flex;
   flex-direction: column;
   gap: 7px;
-}
-
-.needed-list li {
-  display: flex;
-  align-items: flex-start;
-  gap: 9px;
-  font-size: 13px;
-  line-height: 1.4;
-  color: var(--chrome-body);
-}
-
-.needed-list li.done {
-  color: var(--chrome-muted);
-  text-decoration: line-through;
-}
-
-.needed-list li.empty {
-  color: var(--chrome-muted);
-  font-style: italic;
-}
-
-.tick-box {
-  flex-shrink: 0;
-  width: 15px;
-  height: 15px;
-  margin-top: 2px;
-  border-radius: 4px;
-  border: 1.5px solid var(--chrome-muted);
-  position: relative;
-}
-
-.needed-list li.done .tick-box {
-  border-color: var(--success);
-  background: rgba(143, 211, 154, 0.2);
-}
-
-.needed-list li.done .tick-box::after {
-  content: "";
-  position: absolute;
-  left: 4px;
-  top: 1px;
-  width: 4px;
-  height: 8px;
-  border: solid var(--success);
-  border-width: 0 2px 2px 0;
-  transform: rotate(45deg);
-}
-
-.needed-list li.blocker .tick-box {
-  border-color: var(--warning);
 }
 
 .team-feed li {
@@ -663,232 +612,9 @@ h1 {
   overflow-wrap: anywhere;
 }
 
-.note.title {
-  font-size: 32px;
-  font-weight: 600;
-}
-
-.note.blank {
-  color: var(--ink-red);
-}
-
-.note.blank .blank-line {
-  display: inline-block;
-  width: 150px;
-  height: 0;
-  border-bottom: 2px solid var(--ink-red);
-  vertical-align: -6px;
-  margin-left: 8px;
-}
-
-.note.urgent {
-  color: var(--ink-red);
-  text-decoration: underline;
-  text-decoration-thickness: 2px;
-  text-underline-offset: 5px;
-}
-
-.note.check {
-  color: var(--ink-green);
-}
-
-.note.check::before {
-  content: "";
-  position: absolute;
-  left: -54px;
-  top: 8px;
-  width: 9px;
-  height: 17px;
-  border: solid var(--ink-green);
-  border-width: 0 3px 3px 0;
-  transform: rotate(40deg);
-}
-
-.note.flag::before {
-  content: "!";
-  position: absolute;
-  left: -52px;
-  top: -2px;
-  font-family: var(--hand);
-  font-size: 34px;
-  font-weight: 600;
-  color: var(--ink-red);
-}
-
 .note.aside {
   font-size: 22px;
   color: var(--ink-soft);
-}
-
-.note.ink-in {
-  animation: inkIn 720ms cubic-bezier(0.2, 0.7, 0.3, 1) both;
-}
-
-@keyframes inkIn {
-  from {
-    clip-path: inset(0 100% 0 0);
-    opacity: 0.4;
-  }
-  to {
-    clip-path: inset(0 0 0 0);
-    opacity: 1;
-  }
-}
-
-.pinboard {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 30px 26px;
-  margin-top: 28px;
-  align-items: flex-start;
-}
-
-.polaroid {
-  position: relative;
-  width: 220px;
-  padding: 8px 8px 12px;
-  background: #fff;
-  border: 1px solid #d9d0bb;
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.16);
-  transform: rotate(var(--tilt, -2deg));
-  animation: pinIn 520ms cubic-bezier(0.2, 0.8, 0.3, 1.2) both;
-  margin: 0;
-}
-
-.polaroid.sketch {
-  width: 340px;
-}
-
-.polaroid::before {
-  content: "";
-  position: absolute;
-  top: -10px;
-  left: 50%;
-  width: 74px;
-  height: 20px;
-  margin-left: -37px;
-  background: var(--tape);
-  transform: rotate(-3deg);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
-}
-
-.polaroid img {
-  display: block;
-  width: 100%;
-  height: auto;
-  background: #e6e1d6;
-}
-
-.polaroid.sketch img {
-  border: 1px solid #ece6d8;
-}
-
-.polaroid figcaption {
-  font-family: var(--hand);
-  font-size: 19px;
-  line-height: 21px;
-  color: var(--ink);
-  margin-top: 8px;
-}
-
-.polaroid .tag {
-  font-family: var(--hand-label);
-  font-size: 13px;
-  color: var(--ink-soft);
-  display: block;
-  margin-top: 3px;
-}
-
-.polaroid.sketch figcaption {
-  color: var(--ink-blue);
-}
-
-.polaroid .tag.unconfirmed {
-  color: var(--ink-red);
-}
-
-@keyframes pinIn {
-  from {
-    opacity: 0;
-    transform: rotate(var(--tilt, -2deg)) translateY(18px) scale(0.96);
-  }
-  to {
-    opacity: 1;
-    transform: rotate(var(--tilt, -2deg)) translateY(0) scale(1);
-  }
-}
-
-.stamp {
-  position: absolute;
-  right: 44px;
-  bottom: 42px;
-  padding: 6px 16px;
-  border: 4px solid var(--ink-red);
-  border-radius: 6px;
-  color: var(--ink-red);
-  font-family: var(--hand-label);
-  font-size: 30px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  transform: rotate(-9deg);
-  opacity: 0.85;
-  mix-blend-mode: multiply;
-  animation: stampIn 420ms cubic-bezier(0.2, 0.9, 0.3, 1.4) both;
-}
-
-.stamp[hidden] {
-  display: none;
-}
-
-.stamp.success {
-  border-color: var(--ink-green);
-  color: var(--ink-green);
-}
-
-.stamp.info {
-  border-color: var(--ink-blue);
-  color: var(--ink-blue);
-}
-
-@keyframes stampIn {
-  from {
-    opacity: 0;
-    transform: rotate(-9deg) scale(1.6);
-  }
-  to {
-    opacity: 0.85;
-    transform: rotate(-9deg) scale(1);
-  }
-}
-
-.pen {
-  position: absolute;
-  left: 92px;
-  bottom: 48px;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-family: var(--hand);
-  font-size: 22px;
-  color: var(--ink-soft);
-}
-
-.pen[hidden] {
-  display: none;
-}
-
-.pen-nib {
-  width: 14px;
-  height: 14px;
-  border-radius: 50% 50% 50% 0;
-  background: var(--ink);
-  transform: rotate(-45deg);
-  animation: scribble 0.9s ease-in-out infinite;
-}
-
-@keyframes scribble {
-  0%, 100% { transform: rotate(-45deg) translate(0, 0); }
-  50% { transform: rotate(-45deg) translate(3px, -2px); }
 }
 
 .packet-dialog {
@@ -943,16 +669,6 @@ h1 {
   font-weight: 600;
 }
 
-.packet-dialog pre {
-  white-space: pre-wrap;
-  margin: 0;
-  padding: 20px;
-  color: var(--chrome-body);
-  font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  max-height: 68vh;
-  overflow: auto;
-}
-
 @media (max-width: 1080px) {
   .desk-layout {
     grid-template-columns: 1fr;
@@ -963,73 +679,6 @@ h1 {
     padding-left: 78px;
   }
 }
-
-/* Live avatar uses the existing desk palette. */
-.avatar-stage {
-  position: relative;
-  width: 100%;
-  height: 360px;
-  overflow: hidden;
-  margin-bottom: 12px;
-  border: 1px solid var(--card-line);
-  border-radius: 12px;
-  background: var(--desk-edge);
-}
-#avatarVideo {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  object-position: center 35%;
-}
-.avatar-disclosure {
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  padding: 5px 9px;
-  border: 1px solid var(--card-line);
-  border-radius: 999px;
-  background: var(--card);
-  color: var(--chrome-body);
-  font-size: 11px;
-  font-weight: 500;
-}
-.avatar-identity {
-  position: absolute;
-  right: 10px;
-  bottom: 10px;
-  left: 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 10px 12px;
-  border: 1px solid var(--card-line);
-  border-radius: 8px;
-  background: var(--card);
-  color: var(--chrome-ink);
-}
-#avatarName { font-size: 13px; font-weight: 600; }
-#avatarStatus { font-size: 11px; color: var(--chrome-body); }
-.avatar-stage[data-state="error"] #avatarStatus { color: var(--danger); }
-.avatar-resume {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  max-width: calc(100% - 24px);
-  padding: 9px 16px;
-  border: 1px solid var(--card-line);
-  border-radius: 999px;
-  background: var(--card);
-  color: var(--chrome-ink);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-}
-.avatar-resume:hover { background: var(--desk); }
-.avatar-resume:focus-visible { outline: 2px solid var(--paper); outline-offset: 3px; }
-.avatar-stage [hidden] { display: none; }
 
 /* Keep the call, field notes, and conversation visible together. */
 .transcript-card {
@@ -1042,7 +691,6 @@ h1 {
 .turn p { min-width: 0; overflow-wrap: anywhere; }
 .notebook-wrap:focus-visible,
 .transcript:focus-visible,
-.needed-list:focus-visible,
 .team-feed:focus-visible {
   outline: 2px solid var(--chrome-muted);
   outline-offset: -2px;
@@ -1064,9 +712,6 @@ h1 {
     display: grid;
     grid-template-rows: minmax(0, 1fr) minmax(100px, 0.24fr);
   }
-  .media-column:has(.avatar-stage[hidden]) {
-    grid-template-rows: auto minmax(100px, 1fr);
-  }
   .call-card {
     min-height: 0;
     display: flex;
@@ -1075,11 +720,6 @@ h1 {
     overflow: auto;
   }
   .call-card .card-head { margin-bottom: 0; flex-shrink: 0; }
-  .call-card .avatar-stage {
-    flex: 1 0 120px;
-    height: auto;
-    margin-bottom: 0;
-  }
   .call-card .camera-stage {
     flex: 0 0 clamp(100px, 21dvh, 180px);
     aspect-ratio: auto;
@@ -1088,13 +728,10 @@ h1 {
   .call-card .controls { margin-bottom: 0; flex-shrink: 0; gap: 6px; }
   .call-card .round-button { padding: 10px 4px; }
   .call-card .round-label { font-size: 11px; }
-  .avatar-identity { right: 6px; bottom: 6px; left: 6px; padding: 8px; }
-  .team-card,
-  .needed-card { min-height: 0; display: flex; flex-direction: column; }
+  .team-card { min-height: 0; display: flex; flex-direction: column; }
   .team-card .card-head { align-items: flex-start; gap: 8px; }
   .team-card .card-hint { max-width: 150px; }
-  .team-feed,
-  .needed-list { min-height: 0; overflow: auto; }
+  .team-feed { min-height: 0; overflow: auto; }
   .conversation-column {
     display: grid;
     grid-template-rows: minmax(0, 0.85fr) minmax(0, 1.15fr);
@@ -1107,12 +744,8 @@ h1 {
 
 @media (min-width: 900px) and (max-height: 750px) {
   .call-card { gap: 8px; padding: 12px; }
-  .call-card .avatar-stage { flex-basis: 180px; }
   .call-card .camera-stage { flex-basis: 100px; }
   .call-card .round-button { padding: 6px 2px; gap: 4px; }
-  .avatar-identity { padding: 6px; gap: 2px; }
-  #avatarName { font-size: 11px; }
-  #avatarStatus { font-size: 10px; }
 }
 
 @media (min-width: 900px) and (max-width: 1200px) {
@@ -1139,7 +772,6 @@ h1 {
   .media-column { grid-row: 1; }
   .conversation-column { grid-row: 2; }
   .notebook-wrap { grid-row: 3; }
-  .avatar-stage { height: 320px; }
   .camera-stage { max-height: 220px; }
   .team-feed { max-height: 160px; overflow: auto; }
   .notebook { min-height: 600px; padding-right: 20px; }

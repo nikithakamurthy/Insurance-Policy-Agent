@@ -2,11 +2,11 @@
 
 The live app keeps each sharp frame in which Grounding DINO detected a book and hands it to
 the worker. One BookJob per sweep runs books_agent (pipeline/books_agent.py, an ADK
-SequentialAgent: OCR -> catalogue search -> LLM match -> verify -> price) on each frame in
+SequentialAgent: OCR -> catalogue search -> rule match -> model match + verify -> price) on each frame in
 arrival order, and merges the results:
 
 - accepted books: one line per work, merged across frames (frame_refs), counted and priced;
-- suggested books: the matcher's pick was not supported by the words read; review only;
+- suggested books: the model's pick was not supported by the words read; review only;
 - unread text: confident readings that matched nothing; review only.
 
 Prices are cached per work and redone only if the country changes. Results are written to
@@ -28,7 +28,7 @@ from .books_agent import create_books_agent, run_books_agent
 from .catalog import same_work, significant, tokens
 from .common import write_json
 from .frames import _thumb, is_duplicate
-from .pricing import GoogleBooksPrices, book_totals, ebay_used_prices, load_books_key, price_book
+from .pricing import book_totals, ebay_prices, ebooks_provider, price_book
 from .telemetry import Usage, current as current_usage, stage
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ BATCH = 6    # frames per books_agent run
 
 class BookJob:
     def __init__(self, sweep_dir: Path, reader: Callable[[], Any], rates: Callable[[], Any], *,
-                 language: str = "en", threshold: float = 150.0, measurer: Callable[[], Any] | None = None):
+                 threshold: float = 150.0, measurer: Callable[[], Any] | None = None):
         self.sweep_dir = Path(sweep_dir)
         self._reader, self._rates = reader, rates
         # Spine measurement (pipeline/measure.py) runs on each frame right after its OCR, in its own
@@ -47,7 +47,7 @@ class BookJob:
         self.measure_task: asyncio.Task | None = None
         self.frame_measures: dict[str, Any] = {}       # frame_ref -> measure.FrameResult
         self.measuring = False
-        self.language, self.threshold = language, threshold
+        self.threshold = threshold
         self.queue: asyncio.Queue = asyncio.Queue()
         self.lines: dict[str, dict] = {}
         self.identified: list[dict] = []
@@ -68,9 +68,10 @@ class BookJob:
         self._agent = None
         self.registry: dict[str, dict] = {}      # work_key -> accepted book, merged across frames
         self.suggested: dict[str, dict] = {}     # work_key -> pick not supported by the OCR text
+        self.declined: set[str] = set()          # suggestions the policyholder said are not theirs
         self.unread: dict[str, dict] = {}        # reading text -> {text, frame_refs, ocr_confidence}
         self.matched_by: dict[str, int] = {}     # which matcher decided (the model, or the rules fallback)
-        # Books the policyholder asked to leave out (not theirs, borrowed, not to be claimed): kept on
+        # Books the policyholder asked to leave out (not theirs, borrowed, not to be covered): kept on
         # record, marked, and out of every total. A title not identified yet waits in pending_exclusions.
         self.usage = Usage()                     # latency per stage and outside requests, this sweep
         # Copies the policyholder confirmed (work_key -> count). A title read on two spines in one
@@ -215,13 +216,11 @@ class BookJob:
         """PriceBooks step callback: price a newly accepted work once per sweep."""
         if not self.currency:
             return None
-        if book["work_key"] not in self.prices or self.prices[book["work_key"]].get("retry_replacement"):
-            key = load_books_key()
-            provider = GoogleBooksPrices(key, self.language) if key else None
+        if book["work_key"] not in self.prices or self.prices[book["work_key"]].get("retry"):
             try:
                 with stage("pricing: one book"):
-                    self.prices[book["work_key"]] = price_book(book, provider, self.country, self.currency, self._rates(),
-                                                               self.threshold, ebay_used_prices())
+                    self.prices[book["work_key"]] = price_book(book, self.country, self.currency, self._rates(),
+                                                               self.threshold, ebay_prices(), ebooks=ebooks_provider())
             except Exception as exc:
                 self.errors = (self.errors + [f"pricing {book['title'][:40]}: {type(exc).__name__}"])[-10:]
                 return None
@@ -233,7 +232,8 @@ class BookJob:
         Learning Systems" matches a different catalogue work of exactly that name."""
         words = {k: set(significant(tokens(b["title"]))) for k, b in self.registry.items()}
         for key, book in list(self.registry.items()):
-            if not book.get("author_hit") and any(words[key] < words[other] for other in self.registry if other != key):
+            if not book.get("author_hit") and not book.get("confirmed_by_policyholder") and \
+                    any(words[key] < words[other] for other in self.registry if other != key):
                 del self.registry[key]
                 self.prices.pop(key, None)
 
@@ -254,12 +254,16 @@ class BookJob:
         self._drop_title_fragments()
         self._apply_pending_exclusions()
         for line in verified.get("suggested", []):
-            if line["work_key"] not in self.registry and not any(same_work(b["title"], b["author"], line["title"], line["author"])
+            if line["work_key"] not in self.registry and line["work_key"] not in self.declined and \
+                    not any(same_work(b["title"], b["author"], line["title"], line["author"])
                                                                  for b in self.registry.values()):
                 self.suggested.setdefault(line["work_key"], {**line, "frame_refs": set()})["frame_refs"].update(line["frame_refs"])
         for item in verified.get("unread", []):
             entry = self.unread.setdefault(item["text"], {"text": item["text"], "frame_refs": set(), "ocr_confidence": item["confidence"]})
             entry["frame_refs"].update(item["frame_refs"])
+        self._refresh()
+
+    def _refresh(self) -> None:
         self.identified = [{**b, "id": f"book-{i:03d}", "frame_refs": sorted(b["frame_refs"])}
                            for i, b in enumerate(self.registry.values(), 1)]
         unread = [{**u, "frame_refs": sorted(u["frame_refs"])} for u in self.unread.values()]
@@ -268,25 +272,50 @@ class BookJob:
                             "suggested": [{**b, "frame_refs": sorted(b["frame_refs"])} for b in self.suggested.values()],
                             "matched_by": self.matched_by, "method": "books_agent (ADK SequentialAgent)"}
 
+    def confirm(self, title: str, confirmed: bool) -> dict:
+        """The policyholder's answer about a suggested book (the model's pick that the words read did
+        not support). Yes: it joins the inventory, marked as confirmed by them. No: it is dropped and
+        not suggested again."""
+        scored = sorted(((self._title_match(title, b), b) for b in self.suggested.values()), key=lambda x: -x[0])
+        matches = [b for score, b in scored if score >= 80]
+        if len(matches) > 1 and scored[0][0] - scored[1][0] >= 10:
+            matches = matches[:1]
+        if len(matches) != 1:
+            return {"status": "ambiguous" if matches else "not_found",
+                    "candidates": [f"{b['title']} by {b['author']}" for b in (matches or list(self.suggested.values()))[:6]]}
+        book = self.suggested.pop(matches[0]["work_key"])
+        if not confirmed:
+            self.declined.add(book["work_key"])
+        else:
+            self.registry[book["work_key"]] = {**book, "frame_ref": sorted(book["frame_refs"])[0], "frame_refs": set(book["frame_refs"]),
+                                               "id_confidence": book.get("title_coverage"), "confirmed_by_policyholder": True}
+        self._refresh()
+        self.updated_at = time.time()
+        return {"status": "added" if confirmed else "declined", "title": book["title"], "author": book["author"]}
+
+    def to_confirm(self, frame_refs: list[str] | None = None) -> list[str]:
+        """Suggested books to ask the policyholder about, optionally only those read on these frames."""
+        wanted = {self._original(f) for f in frame_refs} if frame_refs is not None else None
+        return [f"{b['title']} by {b['author']}".strip() for b in self.suggested.values()
+                if wanted is None or {self._original(f) for f in b["frame_refs"]} & wanted][:5]
+
     def _price_new(self) -> None:
         """Price every identified work without a price yet. A failure leaves that one book
         unpriced for a later retry; it never stops the rest of the sweep."""
         self.last_price_attempt = time.time()
-        key = load_books_key()
-        provider = GoogleBooksPrices(key, self.language) if key else None
         rates = self._rates()
         for book in self.identified:
-            if book["work_key"] in self.prices and not self.prices[book["work_key"]].get("retry_replacement"):
+            if book["work_key"] in self.prices and not self.prices[book["work_key"]].get("retry"):
                 continue
             try:
-                self.prices[book["work_key"]] = price_book(book, provider, self.country, self.currency, rates, self.threshold,
-                                                           ebay_used_prices())
+                self.prices[book["work_key"]] = price_book(book, self.country, self.currency, rates, self.threshold, ebay_prices(),
+                                                           ebooks=ebooks_provider())
             except Exception as exc:
                 self.errors = (self.errors + [f"pricing {book['title'][:40]}: {type(exc).__name__}"])[-10:]
 
     def maybe_retry(self, every_s: float = 20.0) -> None:
-        """When idle, retry books whose price lookup failed (for example a rate limit)."""
-        missing = self.currency and any(b["work_key"] not in self.prices or self.prices[b["work_key"]].get("retry_replacement")
+        """When idle, retry books whose price lookup failed (eBay unreachable)."""
+        missing = self.currency and any(b["work_key"] not in self.prices or self.prices[b["work_key"]].get("retry")
                                         for b in self.identified)
         idle = (self.task is None or self.task.done()) and not self.busy
         if missing and idle and time.time() - self.last_price_attempt >= every_s:
@@ -439,18 +468,19 @@ class BookJob:
                         "frame_ref": book["frame_ref"], "frame_refs": book["frame_refs"], "id_confidence": book["id_confidence"],
                         **(price or {"status": "identified", "replacement_cost": None, "used_value": None}),
                         "excluded": self.excluded.get(book["work_key"]),
-                        "copies": self.copies.get(book["work_key"], 1), "copies_confirmed": book["work_key"] in self.copies})
+                        "copies": self.copies.get(book["work_key"], 1), "copies_confirmed": book["work_key"] in self.copies,
+                        "confirmed_by_policyholder": bool(book.get("confirmed_by_policyholder"))})
         return out
 
     def totals(self, books: list[dict] | None = None) -> dict:
-        """Totals of the books still in the claim; left-out books are counted separately."""
+        """Totals of the books still in the inventory; left-out books are counted separately."""
         books = self.lines_out() if books is None else books
         kept = [b for b in books if not b["excluded"]]
         totals = book_totals(kept) if kept else {"books_identified": 0, "books_priced": 0, "books_replacement_cost": 0.0}
         return {**totals, "books_excluded": len(books) - len(kept)}
 
     def _write(self, identified: dict) -> None:
-        write_json(self.sweep_dir / "spine_text.json", {"model": "docTR, three orientations (live)", "lines": self.lines})
+        write_json(self.sweep_dir / "spine_text.json", {"model": "docTR, rotated boxes, four orientations (live)", "lines": self.lines})
         write_json(self.sweep_dir / "books_identified.json", identified)
         books = self.lines_out()
         write_json(self.sweep_dir / "books_priced.json", {"country": self.country, "currency": self.currency,

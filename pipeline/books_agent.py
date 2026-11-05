@@ -1,16 +1,17 @@
 """books_agent: Google ADK SequentialAgent that identifies and prices the books in a batch of frames.
 
-Same design as the reference app's claim team (reference_app/agent.py): steps in a
+Steps in a Google ADK
 SequentialAgent, passing results through ADK session.state. All steps are deterministic Python
-except the match step, which uses an LLM and falls back to the rules on any model failure.
+except the model match, which only adds to what the rules found and does nothing if it fails.
 The live worker runs it on batches of frames in which Grounding DINO detected a book.
 
-    ① ReadSpines     Python    docTR OCR, three orientations           -> state["readings"]
+    ① ReadSpines     Python    docTR OCR, four orientations             -> state["readings"]
     ② SearchMarket   Python    top-10 catalogue results per reading     -> state["search_results"]
-    ③ MatchBooks     LlmAgent  picks the closest of the top-10 results  -> state["matches"]
-                               (rules keep their confident matches; if the model fails, rules decide;
-                               BOOKS_MATCHER=rules: rules only)
-    ④ VerifyMatches  Python    words actually read must support the pick -> state["verified"]
+    ③ MatchRules     Python    score_match picks; accepted as they are  -> state["matches"], state["verified"]
+    ④ MatchModel     LlmAgent  readings the rules left: the model picks, -> state["verified"] (added to)
+                     + verify  and each pick must be supported by the words read; unsupported picks
+                               are only "suggested". Skipped when nothing is left, the model is off
+                               (BOOKS_MATCHER=rules) or paused; on a model failure it adds nothing.
     ⑤ PriceBooks     Python    marketplace price by country, converted  -> state["priced"]
 
 The LLM never produces a price or a total, and a pick that the OCR text does not support is
@@ -34,9 +35,11 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
 from pydantic import BaseModel, ConfigDict, Field
+from rapidfuzz import fuzz
 from typing_extensions import override
 
-from .catalog import _author_read, _found, _with_joins, first_publish_year, plausible, score_match, search, significant, tokens
+from .catalog import (_author_read, _with_joins, beyond_title, first_publish_year, plausible, score_match, search,
+                      significant, title_coverage, tokens)
 from .pricing import APPRAISAL_YEAR
 from .spine_ocr import candidates_from_lines
 from .telemetry import record_call, stage
@@ -48,12 +51,13 @@ MATCHER = os.getenv("BOOKS_MATCHER", "gemini")
 MODEL = os.getenv("BOOKS_AGENT_MODEL", "gemini-3.6-flash")
 MAX_READINGS = 40          # per batch of frames; readings with two or more real words first, then clearest
 MIN_OCR_CONFIDENCE = 0.6
+SAME_READING = 85          # token_sort_ratio: two readings of one spine (word order or a misread letter apart)
 FALLBACK_CONFIDENCE = 0.9  # search retries with fewer words only above this OCR confidence
 QUOTA_PAUSE_S = 120        # after a quota error, skip the model this long instead of waiting on failing calls
 _model_paused_until = 0.0
 
 
-# ---- ADK plumbing (same pattern as reference_app/agent.py) --------------------------------
+# ---- ADK plumbing ---------------------------------------------------------------------------
 def _state_event(author: str, text: str, updates: dict[str, Any]) -> Event:
     return Event(author=author, content=genai_types.Content(role="model", parts=[genai_types.Part(text=text)]),
                  actions=EventActions(state_delta=updates))
@@ -106,74 +110,63 @@ Readings and search results (JSON):
 
 
 class MatchStep(BaseAgent):
-    """③ MatchBooks: the rule-based scorer picks (default, no model calls). With an LLM sub-agent
-    (BOOKS_MATCHER=gemini) the model picks, and the rules take over if the model is unavailable."""
+    """④ MatchModel: the model picks for the readings the rules could not match, and each pick is
+    checked against the words read (verify). Rules' matches are never touched; if the model is
+    off, paused or fails, nothing is added and nothing is verified."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
+    verify: Callable[[dict, list[dict]], dict]
+
     @override
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        everything = ctx.session.state.get("search_results", [])
-        if not any(r["results"] for r in everything):
-            yield _state_event(self.name, "Nothing to match.", {"matches": {"matches": [], "by": "none"}})
-            return
-        # Readings of books already identified in this sweep keep that match; only new ones are matched.
-        seen = [{"reading_id": r["id"], "work_key": r["results"][0]["work_key"], "evidence": r["text"]}
-                for r in everything if r.get("known")]
-        request = [r for r in everything if not r.get("known")]
         global _model_paused_until
-        if not any(r["results"] for r in request) or not self.sub_agents or time.monotonic() < _model_paused_until:
-            by = ("seen earlier" if not any(r["results"] for r in request) else
-                  "rules" if not self.sub_agents else "rules (model paused after quota error)")
-            matches = {"matches": seen + _rule_matches(request), "by": by}
-            ctx.session.state["matches"] = matches
-            yield _state_event(self.name, f"Matched by {by}.", {"matches": matches})
+        state = ctx.session.state
+        left = state.get("left_for_model", [])
+        if not left or not self.sub_agents or time.monotonic() < _model_paused_until:
+            why = ("nothing left for the model" if not left else "model off (BOOKS_MATCHER=rules)" if not self.sub_agents
+                   else "model paused after a quota error")
+            if left and self.sub_agents:
+                state["matches"]["by"] = "rules (model paused after quota error)"
+            yield _state_event(self.name, f"Skipped: {why}.", {"matches": state["matches"]})
             return
-        matches = None
-        timer = stage(self.name)
-        timer.__enter__()
-        for attempt in range(2):   # one retry: Gemini's transient server errors usually clear in seconds
-            try:
-                async for event in self.sub_agents[0].run_async(ctx):
-                    if event.usage_metadata:
-                        record_call("gemini_matcher", input_tokens=event.usage_metadata.prompt_token_count or 0,
-                                    output_tokens=event.usage_metadata.candidates_token_count or 0)
-                    yield event
-                raw = ctx.session.state.get("llm_matches") or {}
-                picked = [m for m in (raw.get("matches", []) if isinstance(raw, dict) else []) if m.get("work_key")]
-                # The model decides readings the rules could not; matches the rules already accept are
-                # kept even if the model skipped them, so adding the model never loses a book.
-                decided = {m["reading_id"] for m in picked}
-                kept = [m for m in _rule_matches(request) if m["reading_id"] not in decided]
-                matches = {"matches": picked + kept, "by": MODEL + ("+rules" if kept else "")}
-                break
-            except Exception as exc:   # quota, network, malformed output: keep the sweep going
-                error = exc
-                record_call("gemini_matcher", ok=False)
-                if "ResourceExhausted" in type(exc).__name__ or "429" in str(exc):
-                    _model_paused_until = time.monotonic() + QUOTA_PAUSE_S
-                if attempt == 0 and "ServerError" in type(exc).__name__:
-                    await asyncio.sleep(2)
-                    continue
-                break
-        timer.__exit__(None, None, None)
-        if matches is None:
-            matches = {"matches": _rule_matches(request), "by": f"rules (model failed: {type(error).__name__})"}
-        matches["matches"] = seen + matches["matches"]
-        ctx.session.state["matches"] = matches
-        yield _state_event(self.name, f"Matched by {matches['by']}.", {"matches": matches})
-
-
-def _rule_matches(request: list[dict]) -> list[dict]:
-    """Fallback matcher: the existing title/author coverage rules."""
-    out = []
-    for item in request:
-        scored = [(score_match(item["text"], r["_doc"]), r) for r in item["results"]]
-        accepted = [(s, r) for s, r in scored if s["accepted"]]
-        if accepted:
-            s, r = max(accepted, key=lambda x: x[0]["score"])
-            out.append({"reading_id": item["id"], "work_key": r["work_key"], "evidence": item["text"]})
-    return out
+        picks, error = None, None
+        with stage(self.name):
+            for attempt in range(2):   # one retry: Gemini's transient server errors usually clear in seconds
+                try:
+                    async for event in self.sub_agents[0].run_async(ctx):
+                        if event.usage_metadata:
+                            record_call("gemini_matcher", input_tokens=event.usage_metadata.prompt_token_count or 0,
+                                        output_tokens=event.usage_metadata.candidates_token_count or 0)
+                        yield event
+                    raw = state.get("llm_matches") or {}
+                    allowed = {r["id"] for r in left}
+                    picks = [m for m in (raw.get("matches", []) if isinstance(raw, dict) else [])
+                             if m.get("work_key") and m.get("reading_id") in allowed]
+                    break
+                except Exception as exc:   # quota, network, malformed output: keep what the rules found
+                    error = exc
+                    record_call("gemini_matcher", ok=False)
+                    if "ResourceExhausted" in type(exc).__name__ or "429" in str(exc):
+                        _model_paused_until = time.monotonic() + QUOTA_PAUSE_S
+                    if attempt == 0 and "ServerError" in type(exc).__name__:
+                        await asyncio.sleep(2)
+                        continue
+                    break
+        if picks is None:
+            state["matches"]["by"] = f"rules (model failed: {type(error).__name__})"
+            yield _state_event(self.name, "Model failed; the rules' matches stand.", {"matches": state["matches"]})
+            return
+        checked = self.verify(state, picks)
+        verified = state["verified"]
+        verified["accepted"] += [b for b in checked["accepted"] if all(b["work_key"] != a["work_key"] for a in verified["accepted"])]
+        verified["suggested"] += checked["suggested"]
+        picked = {m["reading_id"] for m in picks}
+        verified["unread"] = [u for u in verified["unread"] if u["reading_id"] not in picked]
+        state["matches"]["matches"] += picks
+        state["matches"]["by"] = f"rules+{MODEL}"
+        yield _state_event(self.name, f"Model picked {len(picks)}; {len(checked['accepted'])} supported by the words read.",
+                           {"matches": state["matches"], "verified": verified})
 
 
 # ---- step handlers ------------------------------------------------------------------------
@@ -196,11 +189,19 @@ def make_handlers(reader: Callable[[], Any], price: Callable[[dict, dict], dict 
         state["ocr_lines"] = ocr_lines
         readings: dict[str, dict] = {}
         # Two or more real words first: a one-word reading ("HOLDER") rarely identifies a book and
-        # used to crowd out the readings that do.
-        for cand in sorted(candidates, key=lambda c: (len(significant(tokens(c["text"]))) < 2, -c["ocr_confidence"])):
+        # used to crowd out the readings that do. Single strips before pairs of neighbouring strips:
+        # a pair helps only when a spine's title and author are on separate lines, and on a leaning
+        # shelf most pairs join two different books; ranked first, they pushed clean readings past
+        # MAX_READINGS.
+        ranked = sorted(candidates, key=lambda c: (len(significant(tokens(c["text"]))) < 2, c.get("strips", 1) > 1,
+                                                   -c["ocr_confidence"]))
+        for cand in ranked:
             key = " ".join(tokens(cand["text"]))
             if cand["ocr_confidence"] < MIN_OCR_CONFIDENCE or not plausible(cand["text"]):
                 continue
+            # The same spine read in another frame, with the words in another order or a letter
+            # misread, is the same reading too.
+            key = next((k for k in readings if k == key or fuzz.token_sort_ratio(k, key) >= SAME_READING), key)
             if key in readings:
                 readings[key]["frame_refs"] = sorted(set(readings[key]["frame_refs"]) | {cand["frame_ref"]})
             elif len(readings) < MAX_READINGS:
@@ -240,18 +241,58 @@ def make_handlers(reader: Callable[[], Any], price: Callable[[dict, dict], dict 
         jobs = [(contextvars.copy_context(), r) for r in readings]
         with ThreadPoolExecutor(max_workers=6) as pool:
             out = list(pool.map(lambda job: job[0].run(one, job[1]), jobs))
-        state["match_request"] = json.dumps([{"reading_id": r["id"], "reading": r["text"],
-                                              "results": [{k: v for k, v in x.items() if k != "_doc"} for x in r["results"]]}
-                                             for r in out if r["results"] and not r.get("known")], ensure_ascii=False)
         return out
 
-    def verify_matches(state: dict) -> dict:
-        """The pick must be supported by words actually read: title words, and the author or a distinctive title."""
+    def line(state: dict, item: dict, doc: dict, match: dict, by: str, coverage: float, author_hit: bool) -> dict:
+        reading = next(r for r in state.get("readings", []) if r["id"] == item["id"])
+        return {"work_key": doc["key"], "title": doc.get("title", ""), "subtitle": doc.get("subtitle", ""),
+                "author": ", ".join(doc.get("author_name", [])[:3]), "first_publish_year": doc.get("first_publish_year"),
+                "reading": item["text"], "frame_refs": reading["frame_refs"],
+                "evidence": match.get("evidence", ""), "title_coverage": round(coverage, 2),
+                "author_hit": author_hit, "matched_by": by, "published_year_seen": doc.get("published_year_seen"),
+                "catalogue": {"source": doc.get("source", "Open Library"), "url": doc.get("url"),
+                              "query": item["query"], "retrieved_at": item["retrieved_at"]}}
+
+    def match_rules(state: dict) -> dict:
+        """③ Readings of books seen earlier keep that book; the rest are matched by score_match. These
+        matches are accepted as they are (score_match already required the title and the author or
+        a distinctive title in the words read). Readings with results but no match are left for the model."""
+        everything = state.get("search_results", [])
+        accepted, matches, left = [], [], []
+        for item in everything:
+            if not item["results"]:
+                continue
+            scored = [(score_match(item["text"], r["_doc"]), r) for r in item["results"]]
+            ok = [(sc, r) for sc, r in scored if sc["accepted"]]
+            if not ok:
+                left.append(item)
+                continue
+            sc, r = max(ok, key=lambda x: x[0]["score"])
+            by = "seen earlier" if item.get("known") else "rules"
+            match = {"reading_id": item["id"], "work_key": r["work_key"], "evidence": item["text"], "by": by}
+            matches.append(match)
+            if all(b["work_key"] != r["work_key"] for b in accepted):
+                accepted.append(line(state, item, r["_doc"], match, by, sc["title_coverage"], sc["author_hit"]))
+        found = [m["by"] for m in matches]
+        state["matches"] = {"matches": matches, "by": "none" if not any(i["results"] for i in everything)
+                            else "seen earlier" if found and all(b == "seen earlier" for b in found) and not left else "rules"}
+        state["left_for_model"] = left
+        state["match_request"] = json.dumps([{"reading_id": r["id"], "reading": r["text"],
+                                              "results": [{k: v for k, v in x.items() if k != "_doc"} for x in r["results"]]}
+                                             for r in left], ensure_ascii=False)
+        matched = {m["reading_id"] for m in matches}
+        unread = [{"reading_id": r["id"], "text": r["text"], "confidence": r["confidence"], "frame_refs": r["frame_refs"]}
+                  for r in state.get("readings", []) if r["id"] not in matched and r["confidence"] >= 0.95]
+        return {"accepted": accepted, "suggested": [], "unread": unread}
+
+    def verify_picks(state: dict, picks: list[dict]) -> dict:
+        """④ The model's picks must be supported by words actually read in this batch: most of the
+        (main) title, and the author or a title of three or more words. Looser than score_match,
+        which already rejected these readings, but the words must be there."""
         pool = _with_joins([t for r in state.get("readings", []) for t in tokens(r["text"])])
         by_id = {r["id"]: r for r in state.get("search_results", [])}
-        readings_by_id = {r["id"]: r for r in state.get("readings", [])}
         accepted, suggested = [], []
-        for m in state.get("matches", {}).get("matches", []):
+        for m in picks:
             item = by_id.get(m.get("reading_id"))
             doc = next((r["_doc"] for r in (item or {}).get("results", []) if r["work_key"] == m.get("work_key")), None)
             if not item or not doc:
@@ -259,30 +300,15 @@ def make_handlers(reader: Callable[[], Any], price: Callable[[dict, dict], dict 
             # Catalogue titles often carry a subtitle the spine does not ("Spark: The Definitive
             # Guide: Big Data Processing Made Simple"); judge the main title as well, keep the best.
             title = doc.get("title", "")
-            variants = [title] + [title[:i] for i, ch in enumerate(title) if ch == ":"]
-            scored = []
-            for variant in variants:
-                words = significant(tokens(variant))
-                if words:
-                    scored.append((sum(_found(w, pool) for w in words) / len(words), words))
-            coverage, title_words = max(scored, key=lambda x: (x[0], len(x[1])), default=(0.0, []))
-            author_hit = _author_read(doc.get("author_name", []), pool, full_title=coverage >= 0.999)
-            line = {"work_key": doc["key"], "title": doc.get("title", ""), "subtitle": doc.get("subtitle", ""),
-                    "author": ", ".join(doc.get("author_name", [])[:3]), "first_publish_year": doc.get("first_publish_year"),
-                    "reading": item["text"], "frame_refs": readings_by_id[item["id"]]["frame_refs"],
-                    "evidence": m.get("evidence", ""), "title_coverage": round(coverage, 2),
-                    "author_hit": author_hit, "matched_by": state["matches"].get("by"),
-                    "published_year_seen": doc.get("published_year_seen"),
-                    "catalogue": {"source": doc.get("source", "Open Library"), "url": doc.get("url"),
-                                  "query": item["query"], "retrieved_at": item["retrieved_at"]}}
-            supported = coverage >= 0.6 and (author_hit or len(title_words) >= 3)
+            variants = [tokens(title)] + [tokens(title[:i]) for i, ch in enumerate(title) if ch == ":"]
+            coverage, title_words = max(((title_coverage(v, pool), significant(v)) for v in variants if significant(v)),
+                                        key=lambda x: (x[0], len(x[1])), default=(0.0, []))
+            author_hit = _author_read(doc.get("author_name", []), beyond_title(pool, tokens(title)), full_title=coverage >= 0.999)
+            supported = coverage >= 0.6 and (author_hit or len(set(title_words)) >= 3)
             target = accepted if supported else suggested
-            if all(x["work_key"] != line["work_key"] for x in accepted + suggested):
-                target.append(line)
-        matched = {m.get("reading_id") for m in state.get("matches", {}).get("matches", []) if m.get("work_key")}
-        unread = [{"text": r["text"], "confidence": r["confidence"], "frame_refs": r["frame_refs"]} for r in state.get("readings", [])
-                  if r["id"] not in matched and r["confidence"] >= 0.95]
-        return {"accepted": accepted, "suggested": suggested, "unread": unread}
+            if all(x["work_key"] != doc["key"] for x in accepted + suggested):
+                target.append(line(state, item, doc, m, MODEL, coverage, author_hit))
+        return {"accepted": accepted, "suggested": suggested}
 
     def price_books(state: dict) -> list[dict]:
         out = []
@@ -300,7 +326,7 @@ def make_handlers(reader: Callable[[], Any], price: Callable[[dict, dict], dict 
                 out.append({"work_key": book["work_key"], **result})
         return out
 
-    return {"read": read_spines, "search": search_market, "verify": verify_matches, "price": price_books}
+    return {"read": read_spines, "search": search_market, "rules": match_rules, "verify": verify_picks, "price": price_books}
 
 
 def create_books_agent(reader: Callable[[], Any], price: Callable[[dict, dict], dict | None],
@@ -322,16 +348,15 @@ def create_books_agent(reader: Callable[[], Any], price: Callable[[dict, dict], 
         sub_agents=[
             FunctionNode(name="ReadSpines", handler=h["read"], output_key="readings", summary="Read spine text."),
             FunctionNode(name="SearchMarket", handler=h["search"], output_key="search_results", summary="Searched the catalogue."),
-            MatchStep(name="MatchBooks", sub_agents=[matcher] if matcher else []),
-            FunctionNode(name="VerifyMatches", handler=h["verify"], output_key="verified", summary="Checked picks against the OCR text."),
+            FunctionNode(name="MatchRules", handler=h["rules"], output_key="verified", summary="Matched by the rules."),
+            MatchStep(name="MatchModel", verify=h["verify"], sub_agents=[matcher] if matcher else []),
             FunctionNode(name="PriceBooks", handler=h["price"], output_key="priced", summary="Priced new books."),
         ],
     )
 
 
 async def run_books_agent(agent: SequentialAgent, frames: list[dict], country: str, currency: str) -> dict:
-    """Run books_agent on a batch of frames ([{ref, path}]) with a fresh session, like
-    run_claim_workflow in agent.py. Batching keeps up with the camera: OCR runs per frame, but
+    """Run books_agent on a batch of frames ([{ref, path}]) with a fresh session. Batching keeps up with the camera: OCR runs per frame, but
     search and the model call run once for the whole batch."""
     service = InMemorySessionService()
     session_id = f"batch-{frames[0]['ref']}-{uuid.uuid4().hex[:6]}"

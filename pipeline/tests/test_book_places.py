@@ -48,14 +48,5 @@ class BookPlacesTest(unittest.TestCase):
         self.assertEqual(result["place"], "books not given a place")
 
 
-class StatedCountTest(unittest.TestCase):
-    def test_count_is_kept_per_place_and_defaults_to_the_last_place(self):
-        from pipeline.book_places import BookPlaces
-        places = BookPlaces()
-        places.record("bookshelf, top row", ["f1"], {"f1": {"/w/1", "/w/2"}}, {"/w/1": "A", "/w/2": "B"})
-        self.assertEqual(places.set_count("", 12), {"place": "bookshelf, top row", "stated_count": 12, "identified_here": 2})
-        self.assertEqual(places.summary({})["places"][0]["stated_count"], 12)
-
-
 if __name__ == "__main__":
     unittest.main()

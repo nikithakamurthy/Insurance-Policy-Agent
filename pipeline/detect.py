@@ -38,8 +38,6 @@ VOCABULARY: dict[str, str] = {
     "window": "window",
     "door": "door",
 }
-# Structural classes are kept for room context but are never contents to price.
-STRUCTURAL = {"window", "door"}
 # One prompt with the whole vocabulary (well under the 256-token text limit). Measured on
 # sample-1: 2.8x faster than three prompt groups with nearly the same detections.
 PROMPT = list(VOCABULARY)
@@ -179,12 +177,3 @@ def _per_category_nms(found: list[dict], iou: float = 0.5) -> list[dict]:
     return sorted(kept, key=lambda d: -d["score"])
 
 
-def detect_frames(sweep_dir: Path, frames: list[dict], device: str) -> dict:
-    detector = Detector(device)
-    per_frame = {}
-    for i, frame in enumerate(frames, 1):
-        with Image.open(sweep_dir / frame["path"]) as img:
-            per_frame[frame["id"]] = detector.detect(img.convert("RGB"))
-        if i % 10 == 0 or i == len(frames):
-            print(f"  detected {i}/{len(frames)} frames", flush=True)
-    return {"model": detector.model_id, "threshold": detector.threshold, "vocabulary": VOCABULARY, "frames": per_frame}

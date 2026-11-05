@@ -66,18 +66,31 @@ class LocaleEndpointTest(unittest.TestCase):
 
 class AgentPromptTest(unittest.TestCase):
     def test_agent_tools(self):
-        expected = ["set_purpose", "set_country", "log_item", "analyse_books", "get_books", "exclude_book", "set_book_copies",
-                    "set_book_count"]
+        expected = ["set_country", "log_item", "analyse_books", "get_books", "exclude_book", "set_book_copies", "confirm_book",
+                    "room_step", "measure_room"]
         self.assertEqual([d.name for t in tool_declarations() for d in t.function_declarations], expected)
         self.assertEqual(TOOL_NAMES, expected)
 
-    def test_prompt_is_the_contents_insurance_agent(self):
-        for phrase in ("home-contents insurance", "make a claim", "add items", "set_purpose", "logs the objects it sees", "set_book_count",
+    def test_room_is_measured_only_after_the_policyholder_says_ready(self):
+        declaration = next(d for t in tool_declarations() for d in t.function_declarations if d.name == "measure_room")
+        self.assertEqual(sorted(declaration.parameters.required), ["paper", "ready", "wall"])
+        for phrase in ('say "ready"', "Only after they", "wait for the answer", "Never assume the size",
+                       "you when they are there", "call room_step with start", "Do not ask them to repeat it", "touching both walls", "not in a kitchen area, hallway, doorway or alcove", "do not talk\n  about objects in view", "never a number"):
+            self.assertIn(phrase, SYSTEM_INSTRUCTION)
+
+    def test_prompt_is_the_add_to_policy_agent(self):
+        for phrase in ("home-contents insurance", "add\nwhat they own to their policy", "logs the objects it sees",
                        "log_item", "books agent", "analyse_books", "get_books", "Row 1, the top shelf",
                        "Never state a book title", "Never promise coverage"):
             self.assertIn(phrase, SYSTEM_INSTRUCTION)
-        for old in ("first notice of loss", "lookup_policy", "draw_incident_sketch"):
+        for old in ("first notice of loss", "lookup_policy", "draw_incident_sketch", "make a claim", "set_purpose"):
             self.assertNotIn(old, SYSTEM_INSTRUCTION)
+
+    def test_suggested_books_are_confirmed_by_the_policyholder_not_the_agent(self):
+        declaration = next(d for t in tool_declarations() for d in t.function_declarations if d.name == "confirm_book")
+        self.assertEqual(sorted(declaration.parameters.required), ["confirmed", "title"])
+        for phrase in ("to_confirm", "call confirm_book with their", "Never answer for them and never ask twice"):
+            self.assertIn(phrase, SYSTEM_INSTRUCTION)
 
     def test_books_are_handled_only_once_they_are_in_view(self):
         self.assertIn("When books are in view", SYSTEM_INSTRUCTION)
@@ -88,14 +101,7 @@ class AgentPromptTest(unittest.TestCase):
         self.assertIn("derived from the country", locale_instruction("Germany", "EUR"))
 
 
-class PurposeAndItemsTest(unittest.TestCase):
-    def test_purpose(self):
-        session = s.IntakeSession("p")
-        self.assertEqual(s.set_purpose(session, "claim", "water damage last week")["purpose"], "claim")
-        self.assertEqual(session.purpose_details, "water damage last week")
-        with self.assertRaises(ValueError):
-            s.set_purpose(session, "something else")
-
+class ItemsTest(unittest.TestCase):
     def test_log_update_and_no_duplicates(self):
         session = s.IntakeSession("i")
         first = s.log_item(session, {"category": "Furniture", "description": "grey three-seat sofa", "where": "living room"})

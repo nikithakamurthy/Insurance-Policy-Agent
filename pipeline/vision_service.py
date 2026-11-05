@@ -9,14 +9,10 @@ POST /books/{sweep}/frames      queue a saved frame with a book in it for books_
 POST /books/{sweep}/analyse     the books in the frames just shown, recorded under a place.
 GET  /books/{sweep}/summary     everything found so far, per place (final=true waits for reading).
 GET  /books/{sweep}/status      progress and results.
-GET  /books/{sweep}/measure     spine sizes so far; each frame is measured right after its OCR.
 POST /books/{sweep}/exclude     leave a book out of the report and totals (by title or the book in view), or undo.
 POST /books/{sweep}/copies      how many copies of a book the policyholder has.
-POST /books/{sweep}/count       how many books the policyholder says are at a place.
 GET  /books/{sweep}/report      books, prices, exclusions, totals and measurements for the session report.
-GET  /books/{sweep}/usage       latency per stage and outside requests and tokens for the sweep.
-POST /room/{sweep}              measure the room (VGGT, bank card scale) from the room frames, in the background.
-GET  /room/{sweep}              room measurement state and result.
+POST /room/{sweep}/wall         one wall of the room: frames held on its paper sheet, measured now (Depth Pro + sheet).
 
 Detection uses the GPU and answers in about 0.2 s; the book agent's OCR runs on the CPU in the
 background, so live narration is not held up by reading spines.
@@ -170,6 +166,7 @@ async def analyse_books(sweep: str, request: AnalyseRequest) -> dict:
     result = (places.continue_last(refs, by_frame, titles) if request.continue_last
               else places.record(request.place, refs, by_frame, titles))
     result["unreadable_spine_text"] = job.unread_on(refs)[:5]
+    result["to_confirm"] = job.to_confirm(refs)
     result["still_reading"] = not complete
     # No running totals here: they go stale and the agent repeated them as final figures.
     # Counts and money come from GET /books/{sweep}/summary (the get_books tool) only.
@@ -187,8 +184,8 @@ async def books_summary(sweep: str, final: bool = False) -> dict:
     _, titles = job.books_by_frame()
     status = job.status()
     return {**places.summary(titles), "books": status["books"], "totals": status["totals"], "currency": job.currency,
-            "suggested": status.get("suggested", []), "unidentified_readings": status["unidentified_readings"],
-            "still_reading": bool(job.busy or job.queue.qsize())}
+            "suggested": status.get("suggested", []), "to_confirm": job.to_confirm(),
+            "unidentified_readings": status["unidentified_readings"], "still_reading": bool(job.busy or job.queue.qsize())}
 
 
 def _measurer():
@@ -197,13 +194,6 @@ def _measurer():
         from .measure import FrameMeasurer
         _state["measurer"] = FrameMeasurer(pick_device(), detector=_detector())
     return _state["measurer"]
-
-
-@app.get("/books/{sweep}/measure")
-async def measurement(sweep: str) -> dict:
-    """Spine sizes from the frames measured so far; state is "running" until every read frame is measured."""
-    job = _job(sweep)
-    return await asyncio.to_thread(job.measurement)
 
 
 class Exclusion(BaseModel):
@@ -222,20 +212,6 @@ async def exclude_book(sweep: str, request: Exclusion) -> dict:
     return job.exclude(request.title[:200], request.frame_refs[-6:], undo=request.undo, reason=request.reason[:300])
 
 
-class BookCount(BaseModel):
-    place: str = ""          # empty: the place shown last
-    count: int
-
-
-@app.post("/books/{sweep}/count")
-async def set_book_count(sweep: str, request: BookCount) -> dict:
-    """The policyholder's count of the books at a place; unidentified books are the difference."""
-    if not 0 <= request.count <= 5000:
-        raise HTTPException(422, "Count must be between 0 and 5000")
-    _job(sweep)
-    return _places(sweep).set_count(request.place[:120], request.count)
-
-
 class Copies(BaseModel):
     title: str
     copies: int
@@ -245,6 +221,22 @@ class Copies(BaseModel):
 async def set_copies(sweep: str, request: Copies) -> dict:
     """The policyholder's count of copies of one book; totals multiply by it."""
     return _job(sweep).set_copies(request.title[:200], request.copies)
+
+
+class Confirmation(BaseModel):
+    title: str
+    confirmed: bool
+
+
+@app.post("/books/{sweep}/confirm")
+async def confirm_book(sweep: str, request: Confirmation) -> dict:
+    """The policyholder's yes or no about a book the team suggested but could not read clearly enough."""
+    job = _job(sweep)
+    result = job.confirm(request.title[:200], request.confirmed)
+    if result["status"] == "added" and job.currency:
+        await asyncio.to_thread(job._price_new)
+    job._write(job.last_result)
+    return result
 
 
 @app.get("/books/{sweep}/report")
@@ -268,57 +260,52 @@ async def books_report(sweep: str) -> dict:
             if place:
                 shelf[book["work_key"]] = place.label
     unread = [{**u, "frame_refs": sorted(u["frame_refs"])} for u in job.last_result.get("unidentified_readings", [])]
-    place_counts = [{"place": pl.label, "stated": pl.stated_count,
-                     "identified": sum(b["copies"] for b in books if not b["excluded"] and shelf.get(b["work_key"]) == pl.label)}
-                    for pl in places.places.values()]
     return {"country": job.country, "currency": job.currency, "books": books, "totals": job.totals(books),
             "shelf_by_work": shelf, "unread_readings": unread, "possible_copies": job.possible_copies(),
-            "place_counts": place_counts,
             "pending_exclusions": job.pending_exclusions, "suggested": job.status().get("suggested", []),
             "unidentified_readings": job.unidentified, "frames_read": job.frames_read,
+            "room": _room(sweep).status(),
             "still_reading": bool(job.busy or job.queue.qsize()), "measurement": measurement,
-            "room": (_state.get("rooms", {}).get(sweep).status() if _state.get("rooms", {}).get(sweep) else {"state": "not_started"}),
             "usage": job.usage.summary()}
 
 
-@app.get("/books/{sweep}/usage")
-async def books_usage(sweep: str) -> dict:
-    """Latency per stage and outside requests (with cost where rates are configured) for this sweep."""
-    return _job(sweep).usage.summary()
 
 
-async def _run_room(sweep: str) -> None:
-    from .common import pick_device
-    from .telemetry import current as current_usage
 
-    job, room = _job(sweep), _state["rooms"][sweep]
-    current_usage.set(job.usage)
-    deadline = time.time() + 300
-    while (job.busy or job.queue.qsize() or job.measure_queue.qsize() or job.measuring) and time.time() < deadline:
-        await asyncio.sleep(1)       # card frames come from spine measurement; one heavy GPU job at a time
-    card_frames = [ref for ref, result in sorted(job.frame_measures.items()) if result.card]
-    await asyncio.to_thread(room.run, card_frames, _measurer, _detector(), pick_device())
+class RoomWall(BaseModel):
+    wall: str                 # "1" or "2": which of the two walls the policyholder is holding the phone on
+    paper: str = "A4"         # A4 or Letter
+    frames: list[BooksFrame]  # saved frames from the hold
 
 
-@app.post("/room/{sweep}")
-async def start_room(sweep: str) -> dict:
-    """Measure the room from the sweep's room frames, in the background (after the sweep ends)."""
-    from .live_room import RoomJob
+def _room(sweep: str):
+    from .room_corner import CornerRoomJob
 
     _job(sweep)      # validates the sweep id
-    rooms = _state.setdefault("rooms", {})
-    if sweep not in rooms or rooms[sweep].state in {"failed", "not_started"}:
-        rooms[sweep] = RoomJob(SWEEPS / sweep)
-        rooms[sweep].state = "queued"
-        _state.setdefault("room_tasks", {})[sweep] = asyncio.create_task(_run_room(sweep))
-    return rooms[sweep].status()
+    return _state.setdefault("rooms", {}).setdefault(sweep, CornerRoomJob())
 
 
-@app.get("/room/{sweep}")
-async def room_status(sweep: str) -> dict:
-    _job(sweep)
-    room = _state.get("rooms", {}).get(sweep)
-    return room.status() if room else {"state": "not_started", "room": None, "error": None, "seconds": None}
+@app.post("/room/{sweep}/wall")
+async def add_room_wall(sweep: str, request: RoomWall) -> dict:
+    """Measure one wall from the frames held on its sheet; answers when done (a few seconds per frame)."""
+    from .telemetry import current as current_usage
+    from .telemetry import stage
+
+    room = _room(sweep)
+    frames = []
+    for f in request.frames[:12]:
+        path = Path(f.path).resolve()
+        if SWEEPS not in path.parents or not path.is_file():
+            raise HTTPException(422, "Frames must be saved files inside the sweeps folder")
+        frames.append((f.frame_ref, path))
+    measurer = _measurer()
+    current_usage.set(_job(sweep).usage)
+    with stage("room: one wall (sheet + Depth Pro)"):
+        return await asyncio.to_thread(room.add_wall, request.wall[:8], request.paper, frames,
+                                       measurer.detector, measurer.segmenter, measurer.depth_model)
+
+
+
 
 
 class Locale(BaseModel):

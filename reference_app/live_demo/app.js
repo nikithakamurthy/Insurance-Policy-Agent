@@ -1,11 +1,5 @@
 const transcriptEl = document.querySelector("#transcript");
-const notesEl = document.querySelector("#notes");
-const pinboardEl = document.querySelector("#pinboard");
-const stampEl = document.querySelector("#stamp");
-const penEl = document.querySelector("#pen");
-const neededListEl = document.querySelector("#neededList");
 const teamFeedEl = document.querySelector("#teamFeed");
-const readinessEl = document.querySelector("#readiness");
 const callStatus = document.querySelector("#callStatus");
 const modelLabel = document.querySelector("#modelLabel");
 const pageDate = document.querySelector("#pageDate");
@@ -17,8 +11,6 @@ const frameCanvas = document.querySelector("#frameCanvas");
 const newIntakeButton = document.querySelector("#newIntakeButton");
 const textForm = document.querySelector("#textForm");
 const textInput = document.querySelector("#textInput");
-const packetDialog = document.querySelector("#packetDialog");
-const packetMarkdownEl = document.querySelector("#packetMarkdown");
 const reportDialog = document.querySelector("#reportDialog");
 const reportFrame = document.querySelector("#reportFrame");
 const localeForm = document.querySelector("#localeForm");
@@ -45,7 +37,6 @@ if (window.location.protocol === "file:") {
 let liveSocket = null;
 let connectionPromise = null;
 let generation = 0;
-let processing = false;
 let micPending = false;
 let cameraPending = false;
 let resetting = false;
@@ -60,53 +51,24 @@ let isRecording = false;
 let nextPlaybackTime = 0;
 let sessionId = null;
 let state = null;
-let writing = false;
-const seenNotes = new Set();
-
-const routeLabels = {
-  emergency_escalation: ["Escalate to human", "danger"],
-  policy_review: ["Policy review", "warning"],
-  needs_docs: ["Needs docs", "warning"],
-  special_investigation: ["SIU review", "info"],
-  ready_for_adjuster: ["Ready for adjuster", "success"],
-};
-
-const blockerQuestions = {
-  policyholder_name: "Name?",
-  policy_number: "Policy number?",
-  contact_method: "Best contact?",
-  date_of_loss: "When did it happen?",
-  loss_location: "Where?",
-  loss_description: "What happened?",
-};
 
 const teamLabels = {
-  set_purpose: "Purpose",
   set_country: "Country",
   log_item: "Item log",
   analyse_books: "Books agent",
   get_books: "Books agent",
   exclude_book: "Books agent",
   set_book_copies: "Books agent",
-  set_book_count: "Books agent",
+  confirm_book: "Books agent",
+  room_step: "Room",
+  measure_room: "Room",
   vision: "Object detector",
 };
 
 const emptyState = {
-  route: "needs_docs",
-  progress: 0,
-  fields: {},
   transcript: [],
-  events: [],
   tool_activity: [],
-  missing_blockers: [],
-  documents: [],
-  evidence_photos: [],
-  camera_notes: [],
-  sketch: null,
-  policy: null,
-  handoff: {},
-  packet_markdown: "# Adjuster handoff\n\nNo packet yet.",
+  locale: {},
 };
 
 function escapeHtml(value) {
@@ -122,26 +84,9 @@ function now() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function isFilled(field) {
-  if (!field || field.status === "missing") return false;
-  return !/^(missing:|not captured|not specified|unknown|none)/i.test(String(field.value || "").trim());
-}
-
-function shortBlocker(blocker) {
-  if (blockerQuestions[blocker]) return blockerQuestions[blocker];
-  let text = String(blocker).replace(/\s*\([^)]*\)/g, "").trim();
-  if (text.length > 42) text = `${text.slice(0, 40).trim()}...`;
-  return text.endsWith("?") ? text : `${text}?`;
-}
-
 function setStatus(text, tone = "") {
   callStatus.textContent = text;
   callStatus.className = `pill ${tone}`.trim();
-}
-
-function setWriting(next) {
-  writing = next;
-  penEl.hidden = !next;
 }
 
 function setState(nextState) {
@@ -180,13 +125,7 @@ async function saveLocale() {
 
 function render() {
   renderTranscript();
-  renderNotes();
-  renderPinboard();
-  renderNeeded();
   renderTeam();
-  renderStamp();
-  document.querySelector("#downloadPacket").href = sessionId ? `${API_ORIGIN}/api/sessions/${sessionId}/packet` : "#";
-  packetMarkdownEl.textContent = state.packet_markdown || emptyState.packet_markdown;
 }
 
 function renderTranscript() {
@@ -200,155 +139,18 @@ function renderTranscript() {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
-function buildNotes() {
-  const f = state.fields || {};
-  const notes = [];
-  const name = isFilled(f.claimant) ? f.claimant.value : "";
-  const policy = isFilled(f.policy) ? f.policy.value : "";
-  if (name || policy) {
-    notes.push({ key: `title:${name}|${policy}`, cls: "title", text: [name, policy].filter(Boolean).join("  ·  ") });
-  }
-  const record = state.policy;
-  if (record) {
-    if (record.found) {
-      const active = record.status === "active";
-      const extras = (record.coverages || []).slice(0, 1).join("");
-      notes.push({
-        key: `policy:${record.policy_number}:${record.status}`,
-        cls: active ? "check" : "flag urgent",
-        text: active
-          ? `${record.policy_line}, active. ${extras}`
-          : `${record.policy_line}, ${record.status}. Human review before anything else.`,
-      });
-    } else {
-      notes.push({ key: `policy:notfound:${record.policy_number}`, cls: "flag urgent", text: `Policy ${record.policy_number || ""} not found, confirm the number.` });
-    }
-  }
-  const when = isFilled(f.date) ? f.date.value : "";
-  const where = isFilled(f.location) ? f.location.value : "";
-  if (when || where) {
-    notes.push({ key: `whenwhere:${when}|${where}`, cls: "", text: [where, when].filter(Boolean).join(", ") });
-  }
-  if (isFilled(f.description)) {
-    notes.push({ key: `desc:${f.description.value}`, cls: "", text: f.description.value });
-  }
-  if (isFilled(f.injuries)) {
-    const urgent = f.injuries.status === "urgent";
-    notes.push({ key: `inj:${f.injuries.value}`, cls: urgent ? "flag urgent" : "", text: urgent ? `Injury: ${f.injuries.value}` : f.injuries.value });
-  }
-  if (isFilled(f.contact)) {
-    notes.push({ key: `contact:${f.contact.value}`, cls: "aside", text: `Reach at ${f.contact.value}` });
-  }
-  if (isFilled(f.photos)) {
-    notes.push({ key: `ev:${f.photos.value}`, cls: "aside", text: `Has: ${f.photos.value}` });
-  }
-  if (isFilled(f.police)) {
-    notes.push({ key: `rep:${f.police.value}`, cls: "aside", text: `Report: ${f.police.value}` });
-  }
-  if (claimantHasSpoken()) {
-    const seenQuestions = new Set();
-    for (const blocker of state.missing_blockers || []) {
-      const question = shortBlocker(blocker);
-      const dedupe = question.toLowerCase().replace(/[^a-z]/g, "");
-      if (seenQuestions.has(dedupe) || seenQuestions.size >= 3) continue;
-      seenQuestions.add(dedupe);
-      notes.push({ key: `blank:${blocker}`, cls: "blank", text: question, blank: true });
-    }
-  }
-  if (!notes.length) {
-    notes.push({ key: "empty", cls: "aside", text: "Waiting for the claimant. Tap Talk, show the camera, or type below." });
-  }
-  return notes;
-}
-
-function claimantHasSpoken() {
-  return (state.transcript || []).some((turn) => turn.speaker === "Claimant" && String(turn.text || "").trim());
-}
-
-function renderNotes() {
-  const notes = buildNotes();
-  notesEl.innerHTML = notes
-    .map((note) => {
-      const fresh = !seenNotes.has(note.key);
-      seenNotes.add(note.key);
-      return `<div class="note ${note.cls} ${fresh ? "ink-in" : ""}">${escapeHtml(note.text)}${note.blank ? '<span class="blank-line"></span>' : ""}</div>`;
-    })
-    .join("");
-}
-
-function renderPinboard() {
-  const photos = state.evidence_photos || [];
-  const sketch = state.sketch;
-  const cards = photos.map(
-    (photo, index) => `
-      <figure class="polaroid" style="--tilt: ${index % 2 ? 2 : -2.5}deg" data-key="${escapeHtml(photo.id)}">
-        <img src="${photo.data_url}" alt="Camera frame pinned as evidence" />
-        <figcaption>${escapeHtml(photo.caption)}</figcaption>
-        <span class="tag ${photo.confirmed ? "" : "unconfirmed"}">${photo.claimant_description ? `Claimant says: ${escapeHtml(photo.claimant_description)} · ` : ""}${photo.confirmed ? "Supported by this image" : "Claim not confirmed by this image"}</span>
-        <span class="tag">Seen on camera ${escapeHtml(photo.captured_at || "")} · ${escapeHtml(photo.evidence_type || "evidence")}</span>
-      </figure>`
-  );
-  if (sketch) {
-    cards.push(`
-      <figure class="polaroid sketch" style="--tilt: 1.5deg" data-key="sketch-${sketch.version}">
-        <img src="${sketch.data_url}" alt="Hand drawn sketch of the incident scene" />
-        <figcaption>Does this look right?</figcaption>
-        <span class="tag">Sketch ${sketch.version}, drawn from what you described</span>
-      </figure>`);
-  }
-  const currentKeys = [...pinboardEl.querySelectorAll("[data-key]")].map((el) => el.dataset.key).join("|");
-  const nextKeys = [...photos.map((p) => p.id), sketch ? `sketch-${sketch.version}` : ""].filter(Boolean).join("|");
-  if (currentKeys !== nextKeys) pinboardEl.innerHTML = cards.join("");
-}
-
-function renderStamp() {
-  const route = state.route;
-  const [label, tone] = routeLabels[route] || [route, "warning"];
-  stampEl.hidden = !claimantHasSpoken() || writing;
-  stampEl.textContent = label;
-  if (stampEl.dataset.route !== route) {
-    stampEl.dataset.route = route;
-    stampEl.className = `stamp ${tone}`;
-    stampEl.style.animation = "none";
-    void stampEl.offsetWidth;
-    stampEl.style.animation = "";
-  }
-}
-
-function renderNeeded() {
-  const items = [];
-  for (const blocker of state.missing_blockers || []) {
-    items.push({ text: shortBlocker(blocker).replace(/\?$/, ""), cls: "blocker" });
-  }
-  for (const doc of state.documents || []) {
-    items.push({ text: `${doc.item} — ${doc.status || "unknown"}`, cls: doc.already_provided ? "done" : "" });
-  }
-  neededListEl.innerHTML = items.length
-    ? items.map((item) => `<li class="${item.cls}"><span class="tick-box"></span><span>${escapeHtml(item.text)}</span></li>`).join("")
-    : `<li class="empty">Nothing yet. The list fills in as the claim team reads the call.</li>`;
-  const progress = Number(state.progress || 0);
-  readinessEl.textContent = `${progress}% collected`;
-  readinessEl.className = `pill ${progress >= 80 ? "" : progress >= 40 ? "warning" : "neutral"}`;
-}
-
 function renderTeam() {
   const activity = [...(state.tool_activity || [])].slice(-6).reverse();
   teamFeedEl.innerHTML = activity.length
     ? activity
         .map((item) => {
           const phase = item.phase || "running";
-          let headline = item.headline || "";
-          if (item.name === "sync_claim_packet" && phase === "done" && item.result) {
-            const facts = (item.result.open_items || []).length;
-            const docs = (item.result.open_documents || []).length;
-            headline = `${String(item.result.routing_decision || "").replaceAll("_", " ")}: ${facts} open fact${facts === 1 ? "" : "s"}${docs ? ", documents still needed" : ""}`;
-          }
+          const headline = item.headline || "";
           const meta = phase === "running" ? "working" : item.scheduling === "INTERRUPT" ? "interrupted the agent" : item.duration_ms != null ? `${item.duration_ms} ms` : "";
           return `<li><span class="team-dot ${phase}"></span><span><span class="team-name">${escapeHtml(teamLabels[item.name] || item.name)}</span> · ${escapeHtml(headline)}</span><span class="team-meta ${item.scheduling === "INTERRUPT" ? "interrupt" : ""}">${escapeHtml(meta)}</span></li>`;
         })
         .join("")
     : `<li class="empty">The object detector, item log and books agent show up here as they work.</li>`;
-  setWriting(processing || (state.tool_activity || []).some((item) => item.phase === "running"));
 }
 
 function appendSystem(text) {
@@ -407,14 +209,12 @@ async function api(path, options = {}) {
 }
 
 function stopPlayback() {
-  window.claimAvatar?.interrupt();
   for (const source of playbackSources) { try { source.stop(); } catch (_) {} }
   playbackSources.clear();
   nextPlaybackTime = audioContext?.currentTime || 0;
 }
 
 function clearBusy() {
-  processing = false;
   state.tool_activity = (state.tool_activity || []).map(item => item.phase === "running" ? { ...item, phase: "cancelled", headline: "Connection ended" } : item);
   render();
 }
@@ -427,7 +227,6 @@ function disconnectLive() {
   stopLiveVoice(false);
   stopCamera();
   stopPlayback();
-  window.claimAvatar?.reset();
   if (socket) socket.close();
   if (state) clearBusy();
 }
@@ -439,11 +238,10 @@ async function createSession(resume = false) {
   const previous = sessionId || sessionStorage.getItem("intakeSession");
   disconnectLive();
   const epoch = generation;
-  seenNotes.clear();
   setStatus("Connecting", "neutral");
   sessionId = null;
   setState(emptyState);
-  pageDate.textContent = `Claim intake notes · ${new Date().toLocaleDateString([], { month: "short", day: "numeric" })}`;
+  pageDate.textContent = `Inventory report · ${new Date().toLocaleDateString([], { month: "short", day: "numeric" })}`;
   try {
     let payload;
     if (resume && previous) {
@@ -457,7 +255,6 @@ async function createSession(resume = false) {
     sessionStorage.setItem("intakeSession", sessionId);
     setState(payload.state);
     const health = await api("/api/health");
-    window.claimAvatar?.configure(health.avatar);
     modelLabel.textContent = health.live_model;
     setStatus(payload.has_api_key ? "Ready" : "API key required", payload.has_api_key ? "" : "danger");
     textInput.focus();
@@ -474,9 +271,7 @@ function connectLive() {
   if (connectionPromise) return connectionPromise;
   if (!sessionId || resetting) return Promise.reject(new Error("Wait for the intake to be ready."));
   const epoch = generation;
-  const avatarMode = window.claimAvatar?.supported === false ? "&avatar=off" : "";
-  window.claimAvatar?.connecting();
-  const socket = new WebSocket(`${WS_ORIGIN}/ws/live?session_id=${encodeURIComponent(sessionId)}${avatarMode}`);
+  const socket = new WebSocket(`${WS_ORIGIN}/ws/live?session_id=${encodeURIComponent(sessionId)}`);
   liveSocket = socket;
   connectionPromise = new Promise((resolve, reject) => {
     let ready = false;
@@ -492,21 +287,13 @@ function connectLive() {
         setStatus("Live", "");
         resolve();
       } else if (message.type === "session") {
-        window.claimAvatar?.configure(message.avatar);
         modelLabel.textContent = message.model;
-      } else if (message.type === "processing") {
-        processing = message.active;
-        render();
       } else if (message.type === "transcript") {
         upsertStreamingTurn(message.speaker, message.text, message.final, message.id);
       } else if (message.type === "tool") {
         applyToolEvent(message);
       } else if (message.type === "audio") {
         playPcm24(message.data);
-      } else if (message.type === "avatar_video") {
-        window.claimAvatar?.append(message.data);
-      } else if (message.type === "turn_complete") {
-        window.claimAvatar?.finishTurn();
       } else if (message.type === "state") {
         applyServerState(message.state);
       } else if (message.type === "report" || message.type === "report_live") {
@@ -514,7 +301,6 @@ function connectLive() {
       } else if (message.type === "interrupted") {
         stopPlayback();
       } else if (message.type === "error") {
-        processing = false;
         appendSystem(message.message);
         if (!ready) { reject(new Error(message.message)); socket.close(); }
       }
@@ -529,7 +315,6 @@ function connectLive() {
       stopLiveVoice(false);
       stopCamera();
       stopPlayback();
-      window.claimAvatar?.reset();
       clearBusy();
       setStatus("Disconnected — reconnect to continue", "warning");
     };
@@ -554,8 +339,6 @@ async function sendClaimantTurn(text) {
     const id = crypto.randomUUID();
     liveSocket.send(JSON.stringify({ type: "text", text, id }));
     upsertStreamingTurn("Claimant", text, true, id);
-    processing = true;
-    render();
   } catch (error) {
     if (epoch !== generation) return;
     textInput.value = text;
@@ -826,25 +609,7 @@ function openReport(savedPath = "") {
   if (!reportDialog.open) reportDialog.showModal();
 }
 document.querySelector("#openReport").addEventListener("click", () => openReport());
-// Finish sweep: starts the room measurement and builds the packet, without waiting for the agent.
-document.querySelector("#finishSweep").addEventListener("click", async () => {
-  if (!sessionId) return;
-  try {
-    await api(`/api/sessions/${sessionId}/finish`, { method: "POST" });
-    showLiveReport();
-  } catch (error) {
-    appendSystem(`Could not finish the sweep: ${error.message}`);
-  }
-});
 document.querySelector("#reloadReport").addEventListener("click", () => openReport());
 document.querySelector("#closeReport").addEventListener("click", () => { clearTimeout(reportTimer); reportDialog.close(); });
-document.querySelector("#openPacket").addEventListener("click", () => packetDialog.showModal());
-document.querySelector("#closePacket").addEventListener("click", () => packetDialog.close());
-if (window.claimAvatar) {
-  window.claimAvatar.onFallback = () => {
-    disconnectLive();
-    setStatus("Voice mode — tap Talk to reconnect", "neutral");
-  };
-}
 
 createSession(true);

@@ -1,5 +1,1 @@
-"""AI Insurance Claim Intake Agent."""
-
-from .agent import root_agent
-
-__all__ = ["root_agent"]
+"""Home-contents claim live agent: the browser app and voice agent (live_demo/)."""

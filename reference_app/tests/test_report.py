@@ -15,7 +15,7 @@ from packet import build_packet  # noqa: E402
 from report import build_report  # noqa: E402
 
 META = {"sweep_id": "live-test", "captured_at": "2026-11-03T10:00:00+0100", "device": "test browser", "duration_s": 171.5,
-        "country": "Germany", "currency": "EUR", "purpose": "claim", "purpose_details": "water damage"}
+        "country": "Germany", "currency": "EUR"}
 ITEMS = [{"id": "I001", "category": "furniture", "description": "grey sofa", "brand_model": "", "where": "living room", "notes": [],
           "frame_ref": "items/I001.jpg"},
          {"id": "I002", "category": "art", "description": "painting <b>by the door</b>", "brand_model": "", "where": "", "notes": ["a print"]},
@@ -102,47 +102,43 @@ class PacketTest(unittest.TestCase):
         self.assertIn(("book-004", "no price"), reasons)
         self.assertIn(("book-004", "identification confidence 0.7"), reasons)
         self.assertIn(("I003", "art"), reasons)                    # portrait not said to be a print
-        self.assertIn(("room", "room not measured"), reasons)
+        self.assertIn(("room", "room length and width not reported"), reasons)
         status = {i["id"]: i["status"] for i in self.packet["items"]}
         self.assertEqual((status["I002"], status["I003"]), (None, "needs_appraisal"))   # I002 is a print
 
-    GOOD_ROOM = {"length_m": 5.1, "width_m": 4.3, "height_m": 2.6, "floor_area_m2": 21.93, "floor_area_ft2": 236.1,
-                 "wall_area_m2": 49.4, "wall_area_ft2": 531.7, "shelved_wall_area_m2": 1.6, "shape": "rectangle",
-                 "scale_method": "bank card", "scale_estimated": False, "confidence": 0.7, "walls_found": 3,
-                 "floor_plane_found": True, "ceiling_plane_found": True, "frames_used": ["r00001", "f00012"]}
+    ROOM = {"length_m": 4.52, "width_m": 4.06, "corner_offset_m": 0.5, "method": "Depth Pro depth scaled by an A4 sheet",
+            "walls": [{"wall": "1", "distance_m": 3.56, "measured": 4, "spread_m": 0.08, "reasons": []},
+                      {"wall": "2", "distance_m": 4.02, "measured": 3, "spread_m": 0.2, "reasons": []}],
+            "frames_used": ["room_frames/wall1_0.jpg", "room_frames/wall2_0.jpg"], "flags": []}
 
-    def test_reliable_room_fills_the_contract(self):
-        packet = build_packet(META, ITEMS, {**BOOKS, "room": {"state": "done", "room": self.GOOD_ROOM}})
-        self.assertEqual((packet["room"]["floor_area_m2"], packet["room"]["height_m"], packet["room"]["shelved_wall_area_m2"]),
-                         (21.93, 2.6, 1.6))
-        self.assertEqual(packet["room"]["frames_used"], ["room_frames/r00001.jpg", "frames/f00012.jpg"])
-        self.assertFalse([r for r in packet["review_queue"] if r["ref_id"] == "room"])
-        self.assertIn("21.93 m²", build_report(packet))
+    def test_measured_room_fills_length_width_and_area(self):
+        packet = build_packet(META, ITEMS, {**BOOKS, "room": {"state": "done", "room": self.ROOM}})
+        room = packet["room"]
+        self.assertEqual((room["length_m"], room["width_m"], room["floor_area_m2"]), (4.52, 4.06, 18.35))
+        self.assertIsNone(room["height_m"])
+        self.assertEqual(room["frames_used"], ["room_frames/wall1_0.jpg", "room_frames/wall2_0.jpg"])
+        self.assertTrue(CONTRACT["room"] <= set(room))
 
-    def test_unreliable_room_is_left_empty_with_the_reasons(self):
-        weak = {**self.GOOD_ROOM, "walls_found": 0, "confidence": 0.22, "scale_estimated": True}
-        packet = build_packet(META, ITEMS, {**BOOKS, "room": {"state": "done", "room": weak}})
-        self.assertTrue(all(v is None for v in packet["room"].values()))
-        reason = next(r["reason"] for r in packet["review_queue"] if r["ref_id"] == "room")
-        for part in ("left empty", "0 wall(s) found", "confidence 0.22", "estimated by Depth Pro"):
-            self.assertIn(part, reason)
-        self.assertNotIn("21.93", build_report(packet))
+    def test_one_wall_or_disagreeing_frames_leave_the_room_empty(self):
+        one = {**self.ROOM, "length_m": None, "width_m": None,
+               "walls": [self.ROOM["walls"][0], {"wall": "2", "distance_m": None, "measured": 0, "reasons": ["sheet not found"]}]}
+        packet = build_packet(META, ITEMS, {**BOOKS, "room": {"state": "done", "room": one}})
+        self.assertIsNone(packet["room"]["length_m"])
+        self.assertTrue(any("1 of 2 walls measured (sheet not found)" in r["reason"] for r in packet["review_queue"]))
+        noisy = {**self.ROOM, "walls": [self.ROOM["walls"][0], {**self.ROOM["walls"][1], "spread_m": 1.2}]}
+        packet = build_packet(META, ITEMS, {**BOOKS, "room": {"state": "done", "room": noisy}})
+        self.assertIsNone(packet["room"]["length_m"])
+        self.assertTrue(any("frames disagree" in r["reason"] for r in packet["review_queue"]))
 
-    def test_room_without_a_ceiling_leaves_height_and_walls_empty(self):
-        room = {**self.GOOD_ROOM, "ceiling_plane_found": False}
-        packet = build_packet(META, ITEMS, {**BOOKS, "room": {"state": "done", "room": room}})
-        self.assertEqual((packet["room"]["height_m"], packet["room"]["wall_area_m2"], packet["room"]["floor_area_m2"]), (None, None, 21.93))
-        self.assertIn("Ceiling height", build_report(packet))
+    def test_room_still_being_measured_is_said_not_called_skipped(self):
+        packet = build_packet(META, ITEMS, {**BOOKS, "room": {"state": "measuring", "room": None}})
+        self.assertIsNone(packet["room"]["length_m"])
+        self.assertIn("measuring the room", packet["pending"])
+        self.assertTrue(any("still running" in r["reason"] for r in packet["review_queue"] if r["ref_id"] == "room"))
 
-    def test_skipped_room_turn_is_not_an_error(self):
-        packet = build_packet(META, ITEMS, {**BOOKS, "room": {"state": "failed",
-                                                             "error": "ValueError: only 3 room frames saved; at least 8 are needed"}})
-        self.assertIn("room not measured: the room turn was skipped or too short", [r["reason"] for r in packet["review_queue"]])
-
-    def test_room_still_running_is_said(self):
-        packet = build_packet(META, ITEMS, {**BOOKS, "room": {"state": "running"}})
-        self.assertIsNone(packet["room"]["floor_area_m2"])
-        self.assertIn("room measurement still running; reload the report", [r["reason"] for r in packet["review_queue"]])
+    def test_skipped_room_step_is_said(self):
+        reasons = [r["reason"] for r in build_packet(META, ITEMS, BOOKS)["review_queue"] if r["ref_id"] == "room"]
+        self.assertEqual(reasons, ["room length and width not reported: the room step was skipped (no wall measured)"])
 
     def test_detected_objects_join_the_packet_unless_already_logged(self):
         detected = {"sofa": {"count": 1, "score": 0.62, "frame_ref": "items/detected-sofa.jpg"},
@@ -159,15 +155,6 @@ class PacketTest(unittest.TestCase):
         self.assertIn('<td>Chair</td><td class="num">3</td>', page)
         self.assertIn("detected, not confirmed", page)
 
-    def test_policyholder_count_adds_unidentified_books(self):
-        books = {**BOOKS, "place_counts": [{"place": "bookshelf by the window, row 1", "stated": 12, "identified": 2},
-                                           {"place": "coffee table", "stated": None, "identified": 1}]}
-        packet = build_packet(META, ITEMS, books)
-        t = packet["totals"]
-        self.assertEqual((t["books_identified"], t["books_unidentified"], t["book_count"]), (4, 10, 14))
-        self.assertTrue(any(r["ref_id"] == "bookshelf by the window, row 1" and "10 counted but not identified" in r["reason"]
-                            for r in packet["review_queue"]))
-
     def test_used_value_from_few_listings_is_flagged(self):
         used = {"amount": 24.3, "currency": "EUR", "source": "eBay Browse API (current used listings)", "url": "https://www.ebay.de/itm/1",
                 "retrieved_at": "2026-11-03", "condition_assumed": "used", "listings_considered": 1}
@@ -175,6 +162,13 @@ class PacketTest(unittest.TestCase):
         packet = build_packet(META, ITEMS, books)
         self.assertEqual(packet["totals"]["books_used_value"], 24.3)
         self.assertIn("used value from only 1 eBay listing(s)", [r["reason"] for r in packet["review_queue"]])
+
+    def test_book_confirmed_by_the_policyholder_is_counted_and_flagged(self):
+        line = {**BOOKS["books"][0], "confirmed_by_policyholder": True}
+        packet = build_packet(META, ITEMS, {**BOOKS, "books": [line] + BOOKS["books"][1:]})
+        self.assertTrue(packet["books"][0]["confirmed_by_policyholder"])
+        self.assertTrue(any(r["ref_id"] == packet["books"][0]["id"] and "confirmed by the policyholder" in r["reason"]
+                            for r in packet["review_queue"]))
 
     def test_left_out_book_is_kept_apart(self):
         self.assertNotIn("Ikigai", [b["title"] for b in self.packet["books"]])
@@ -184,6 +178,26 @@ class PacketTest(unittest.TestCase):
 class ReportTest(unittest.TestCase):
     def report(self, books=BOOKS, usage=None):
         return build_report(build_packet(META, ITEMS, books), usage)
+
+    def test_report_is_the_policy_inventory(self):
+        page = self.report()
+        self.assertIn("<h1>Policy inventory report</h1>", page)
+        self.assertIn("Adding items to the policy", page)
+        self.assertNotIn("claim report", page.lower())
+
+    def test_room_section_shows_length_width_and_frames(self):
+        page = self.report({**BOOKS, "room": {"state": "done", "room": PacketTest.ROOM}})
+        self.assertIn("<strong>4.52 × 4.06 m</strong>", page)
+        self.assertIn('href="room_frames/wall1_0.jpg"', page)
+
+    def test_ebook_replacement_cost_is_labelled_and_reviewed(self):
+        line = {**BOOKS["books"][0], "replacement_cost": {"amount": 250.0, "currency": "EUR", "edition": "eBook", "country": "IN",
+                                                          "converted": False, "source": "Google Books API (Google Play eBook)",
+                                                          "url": "https://play.google.com/x", "retrieved_at": "2026-11-04"}}
+        packet = build_packet(META, ITEMS, {**BOOKS, "books": [line] + BOOKS["books"][1:]})
+        self.assertEqual(packet["books"][0]["replacement_cost"]["edition"], "eBook")
+        self.assertTrue(any("eBook edition's price" in r["reason"] for r in packet["review_queue"]))
+        self.assertIn("EBOOK PRICE", build_report(packet, None))
 
     def test_objects_by_type_books_and_totals(self):
         page = self.report()
@@ -212,11 +226,11 @@ class ReportTest(unittest.TestCase):
         self.assertIn("Not priced (no rate set): Gemini (book matching)", page)
 
     def test_report_says_when_it_is_still_being_worked_on(self):
-        busy = {**BOOKS, "still_reading": True, "room": {"state": "running"}}
-        page = self.report(busy)
+        page = self.report({**BOOKS, "still_reading": True})
         self.assertIn('<meta name="report-state" content="in-progress">', page)
-        self.assertIn("Still working on: reading book spines, measuring the room", page)
-        self.assertIn('<meta name="report-state" content="complete">', self.report({**BOOKS, "room": {"state": "done", "room": None}}))
+        self.assertIn("Still working on: reading book spines.", page)
+        self.assertIn('<meta name="report-state" content="complete">', self.report(BOOKS))
+        self.assertIn("Room length and width not measured in this sweep", page)
 
     def test_text_is_escaped(self):
         page = self.report()
@@ -279,7 +293,7 @@ class ReportEndpointTest(unittest.TestCase):
         sid, session = self.new_session()
         s.log_item(session, {"category": "lamp", "description": "brass floor lamp"})
         result = self.client.post(f"/api/sessions/{sid}/finish", headers=self.headers).json()
-        self.assertEqual(result["room"], "off")                     # no worker in this test
+        self.assertNotIn("room", result)                            # room measurement is not part of this version
         packet = json.loads((Path(self.tmp.name) / "live-test" / "claim_packet.json").read_text())
         self.assertEqual(packet["items"][0]["description"], "brass floor lamp")
 

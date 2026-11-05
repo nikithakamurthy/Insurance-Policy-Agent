@@ -7,17 +7,21 @@ Order of search
    with the ECB reference rate and labelled converted, with the rate, its date and source.
 No price anywhere: amount stays empty, the book is excluded from totals and sent to review.
 
-Sources
-- Replacement cost: eBay Browse API, the median asking price of current new fixed-price listings
-  of the printed book on the country's eBay site. Without new listings: Google Books API sale
-  information, country-specific but only for Google Play eBooks, so a new eBook edition (stated
-  in condition_assumed).
-- Used value: eBay Browse API, the median asking price of current used fixed-price listings
-  of the same title and author on the country's eBay site. Asking prices, not sold prices.
-  Empty when EBAY_CLIENT_ID / EBAY_CLIENT_SECRET are not set.
+Sources (eBay Browse API only; both empty when EBAY_CLIENT_ID / EBAY_CLIENT_SECRET are not set)
+- Replacement cost: the lower median asking price of current new fixed-price listings of the
+  printed book on the country's eBay site. No new listing anywhere: empty, with the reason.
+- Used value: the same for used listings. Asking prices, not sold prices.
+Replacement cost, by the policyholder's country:
+1. Country with an eBay site: eBay new listings, in the order above.
+2. Country without one (India, for example): the Google Play eBook price in that country (Google
+   Books API), labelled as an eBook edition (edition: "eBook") in the line, packet and report.
+3. No eBook there (or Google Books unavailable): eBay new listings from the other markets above,
+   converted; the line says why the eBook was not used (ebook_lookup).
+The used value is always eBay used listings.
 
 Appraisal: antiquarian works (first published before 1900) and anything priced above the
-appraisal threshold are not priced automatically; they get status needs_appraisal.
+appraisal threshold (set in US dollars, converted to the policyholder's currency with the ECB rate, so
+150 USD is about 12,500 INR) are not priced automatically; they get status needs_appraisal.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ GOOGLE_BOOKS_URL = "https://www.googleapis.com/books/v1/volumes"
 EUROZONE = ["DE", "AT", "FR", "NL", "BE", "IE", "ES", "IT", "FI", "PT"]
 LARGE_MARKETS = ["US", "GB", "CA", "AU", "IN"]
 APPRAISAL_YEAR = 1900
+THRESHOLD_CURRENCY = "USD"
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -73,17 +78,31 @@ def load_books_key() -> str | None:
     return _env("GOOGLE_BOOKS_API_KEY")
 
 
-# Google Books quota: one key, shared by search (catalog.py) and pricing. Once Google says the
-# quota is spent, waiting and retrying inside a batch only stalls reading (minutes per book across
-# ~15 fallback countries), so calls fail fast until the pause ends; unpriced books are retried
-# when the job is idle.
+# Google Books quota (catalogue search in catalog.py). Once Google says the quota is spent,
+# waiting and retrying inside a batch only stalls reading, so searches go to Open Library until
+# the pause ends.
 DAILY_QUOTA_PAUSE_S = 3600
 RATE_LIMIT_PAUSE_S = 60
 _google_books_paused_until = 0.0
 
 
-class GoogleBooksQuotaError(RuntimeError):
-    pass
+# Google Books answers 20-50% of requests with 503 "Service temporarily unavailable" at random
+# (2026-11-04, same query or not), and up to two thirds when several arrive at once. Every search
+# goes through one pacer, and a 503 is retried a few times quickly.
+GOOGLE_BOOKS_MIN_INTERVAL_S = 0.25
+GOOGLE_BOOKS_ATTEMPTS = 5
+GOOGLE_BOOKS_BACKOFF_S = 0.5
+_pace_lock = threading.Lock()
+_last_google_books_request = 0.0
+
+
+def pace_google_books() -> None:
+    global _last_google_books_request
+    with _pace_lock:
+        wait = _last_google_books_request + GOOGLE_BOOKS_MIN_INTERVAL_S - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_google_books_request = time.monotonic()
 
 
 def google_books_paused() -> bool:
@@ -101,66 +120,13 @@ def note_google_books_error(exc: urllib.error.HTTPError, body: str) -> bool:
     return True
 
 
-class GoogleBooksPrices:
-    """Country-specific Google Play eBook prices, restricted to one edition language.
-
-    A store in Germany also sells German translations; a translation is a different edition
-    from the copy on the shelf, so only editions in the spine's language count.
-    """
-    source = "Google Books API (Google Play eBooks)"
-    MIN_INTERVAL_S = 0.25          # pace requests; a burst across many countries trips the rate limit
-    _lock = threading.Lock()
-    _last_request = 0.0
-
-    def __init__(self, api_key: str, language: str = "en"):
-        self.api_key = api_key
-        self.language = language
-
-    def _get(self, params: dict) -> tuple[dict, str]:
-        if google_books_paused():
-            raise GoogleBooksQuotaError("Google Books quota exhausted; pricing paused")
-        with GoogleBooksPrices._lock:
-            wait = GoogleBooksPrices._last_request + self.MIN_INTERVAL_S - time.monotonic()
-            if wait > 0:
-                time.sleep(wait)
-            GoogleBooksPrices._last_request = time.monotonic()
-        try:
-            return get_cached(GOOGLE_BOOKS_URL, params, cache=False)   # prices are always fetched fresh
-        except urllib.error.HTTPError as exc:
-            # A rate or quota limit pauses Google Books; other errors (an invalid country) are permanent.
-            if note_google_books_error(exc, exc.read().decode("utf-8", "replace")):
-                raise GoogleBooksQuotaError(f"Google Books quota exhausted (HTTP {exc.code}); pricing paused") from exc
-            raise
-
-    def offers(self, title: str, author: str, country: str) -> tuple[list[dict], str]:
-        surname = tokens(author.split(",")[0])[-1] if author and tokens(author.split(",")[0]) else ""
-        query = f'intitle:"{title}"' + (f' inauthor:"{surname}"' if surname else "")
-        body, retrieved_at = self._get({"q": query, "country": country, "printType": "books",
-                                        "langRestrict": self.language, "maxResults": 20, "key": self.api_key})
-        found = []
-        for volume in body.get("items", []):
-            info, sale = volume.get("volumeInfo", {}), volume.get("saleInfo", {})
-            price = sale.get("retailPrice") or sale.get("listPrice")
-            if sale.get("saleability") != "FOR_SALE" or not price or info.get("language") != self.language:
-                continue
-            if fuzz.token_set_ratio(title.lower(), info.get("title", "").lower()) < 90:
-                continue
-            if surname and not any(surname in tokens(a) for a in info.get("authors", [])):
-                continue
-            found.append({"amount": float(price["amount"]), "currency": price["currencyCode"], "country": country,
-                          "edition_title": info.get("title"), "language": info.get("language"),
-                          "isbns": [i["identifier"] for i in info.get("industryIdentifiers", []) if i["type"].startswith("ISBN")],
-                          "url": sale.get("buyLink") or info.get("infoLink"), "retrieved_at": retrieved_at})
-        return found, query
-
-
-class EbayUsedPrices:
-    """Used copies for sale on a country's eBay site (Browse API, application token).
+class EbayPrices:
+    """New or used copies for sale on a country's eBay site (Browse API, application token).
 
     Listings count only if their title contains the book's title and the author's surname, and
     they are not a summary or a lot of several books. Fixed-price listings only: an auction's
     current bid is not a price. Shipping is left out."""
-    source = "eBay Browse API (current used listings)"
+    source = "eBay Browse API (current listings)"
     TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
     SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
     MARKETPLACES = {"DE": "EBAY_DE", "AT": "EBAY_AT", "FR": "EBAY_FR", "NL": "EBAY_NL", "IE": "EBAY_IE",
@@ -228,39 +194,35 @@ class EbayUsedPrices:
         return found, query
 
 
-_ebay: EbayUsedPrices | None = None
+_ebay: EbayPrices | None = None
 
 
-def ebay_used_prices() -> EbayUsedPrices | None:
+def ebay_prices() -> EbayPrices | None:
     """The shared eBay client (one token for the process), or None without credentials."""
     global _ebay
     client_id, secret = _env("EBAY_CLIENT_ID"), _env("EBAY_CLIENT_SECRET")
     if not (client_id and secret):
         return None
     if _ebay is None or _ebay.client_id != client_id:
-        _ebay = EbayUsedPrices(client_id, secret)
+        _ebay = EbayPrices(client_id, secret)
     return _ebay
 
 
-def used_value(book: dict, provider, home: str, currency: str, rates: Rates) -> dict:
-    """Median asking price of used copies, following the same country order as replacement cost."""
-    return ebay_value(book, provider, home, currency, rates, "used")
-
-
 def ebay_value(book: dict, provider, home: str, currency: str, rates: Rates, condition: str) -> dict:
-    """Median asking price of current eBay listings in one condition (used, or new for replacement
-    cost when Google Books has no price), in the same country order as replacement cost."""
+    """Lower median asking price of current eBay listings in one condition ("new": replacement
+    cost, "used": used value), in the fallback order of countries."""
     empty = {"amount": None, "currency": currency, "source": None, "url": None, "retrieved_at": None, "condition_assumed": None}
     if provider is None:
-        return {**empty, "reason": "no used-market price source configured (EBAY_CLIENT_ID / EBAY_CLIENT_SECRET)"}
+        return {**empty, "reason": "no price source configured (EBAY_CLIENT_ID / EBAY_CLIENT_SECRET)"}
     tried = []
     for country in fallback_countries(home, currency):
         if country not in provider.MARKETPLACES:
             continue
         try:
             offers, query = provider.offers(book["title"], book.get("author", ""), country, condition)
-        except Exception as exc:   # an eBay failure leaves the used value empty, never the whole book
-            return {**empty, "reason": f"eBay lookup failed in {country}: {type(exc).__name__}", "countries_tried": tried + [country]}
+        except Exception as exc:   # eBay unreachable: this value stays empty and the job retries later
+            return {**empty, "reason": f"eBay lookup failed in {country}: {type(exc).__name__}", "countries_tried": tried + [country],
+                    "lookup_failed": True}
         tried.append(country)
         if not offers:
             continue
@@ -269,8 +231,7 @@ def ebay_value(book: dict, provider, home: str, currency: str, rates: Rates, con
         median = statistics.median_low(o["amount"] for o in offers)
         chosen = next(o for o in offers if o["amount"] == median)
         conditions = sorted({o["condition"] for o in offers if o.get("condition")})
-        value = {"amount": round(median, 2), "currency": chosen["currency"],
-                 "source": provider.source if condition == "used" else "eBay Browse API (current new listings)",
+        value = {"amount": round(median, 2), "currency": chosen["currency"], "source": f"eBay Browse API (current {condition} listings)",
                  "url": chosen["url"], "retrieved_at": chosen["retrieved_at"], "country": country, "converted": False,
                  "condition_assumed": f"{condition} ({', '.join(conditions) or 'condition not stated'}); median (lower middle) asking price of "
                                       f"{len(offers)} current listing(s) of the printed book, shipping excluded, not sold prices",
@@ -290,81 +251,112 @@ def ebay_value(book: dict, provider, home: str, currency: str, rates: Rates, con
             "countries_tried": tried}
 
 
-def price_book(book: dict, provider, home: str, currency: str, rates: Rates, threshold: float,
-               used_provider=None) -> dict:
-    """Replacement cost and used value for one identified book. Books sent to appraisal get neither.
+def local_threshold(threshold: float, currency: str, rates: Rates) -> float:
+    """The appraisal threshold (in THRESHOLD_CURRENCY) in the policyholder's currency. Without a rate for
+    that currency the number is used as is."""
+    try:
+        return rates.convert(threshold, THRESHOLD_CURRENCY, currency)[0]
+    except KeyError:
+        return threshold
 
-    Replacement cost is the median asking price of new copies on eBay (the printed book, as on the
-    shelf). Without new listings it falls back to Google Books (new eBook); a Google Books quota
-    failure is marked retry_replacement so the job tries again later. The used value is the median
-    of used listings on eBay and never depends on Google Books."""
-    year = book.get("first_publish_year")
-    if year and year < APPRAISAL_YEAR:
-        return _replacement(book, provider, home, currency, rates, threshold)      # antiquarian: appraisal, unpriced
-    new = ebay_value(book, used_provider, home, currency, rates, "new") if used_provider is not None else None
-    if new and new["amount"] is not None:
-        if new["amount"] > threshold:
-            return {"status": "needs_appraisal", "appraisal_reason": f"price {new['amount']} {currency} above appraisal "
-                    f"threshold {threshold} {currency}", "replacement_cost": None, "price_seen": new,
-                    "used_value": {"amount": None, "currency": currency, "reason": "not priced: sent to human appraisal"},
-                    "countries_tried": new.get("countries_tried", [])}
-        result = {"status": "identified", "replacement_cost": new, "countries_tried": new.get("countries_tried", [])}
-    else:
+
+class GoogleBooksEbooks:
+    """Google Play eBook prices in one country, from the Google Books API. Only editions in the
+    spine's language whose title and author match; summaries and workbooks are not the book."""
+    source = "Google Books API (Google Play eBook)"
+
+    def __init__(self, api_key: str, language: str = "en"):
+        self.api_key, self.language = api_key, language
+
+    def offers(self, title: str, author: str, country: str) -> list[dict] | None:
+        """Matching eBook offers; None when Google Books could not be asked (quota or error), not "no eBook"."""
+        if google_books_paused():
+            return None
+        main = title.split(":")[0].strip()
+        surname = tokens(author.split(",")[0])[-1] if author and tokens(author.split(",")[0]) else ""
+        params = {"q": f'intitle:"{main}"' + (f' inauthor:"{surname}"' if surname else ""), "country": country,
+                  "printType": "books", "langRestrict": self.language, "maxResults": 20, "key": self.api_key}
         try:
-            result = _replacement(book, provider, home, currency, rates, threshold)
-        except GoogleBooksQuotaError as exc:
-            result = {"status": "identified", "replacement_cost": {"amount": None, "currency": currency, "reason": str(exc)},
-                      "countries_tried": [], "retry_replacement": True}
-        if result["status"] != "identified":
-            return result
-        if new is not None and (result.get("replacement_cost") or {}).get("amount") is not None:
-            result["replacement_cost"]["instead_of"] = f"eBay new copies: {new.get('reason')}"
-    result["used_value"] = used_value(book, used_provider, home, currency, rates)
-    return result
+            body, retrieved_at = get_cached(GOOGLE_BOOKS_URL, params, cache=False, attempts=GOOGLE_BOOKS_ATTEMPTS,
+                                            backoff_s=GOOGLE_BOOKS_BACKOFF_S, before_request=pace_google_books)
+        except OSError as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                note_google_books_error(exc, exc.read().decode("utf-8", "replace"))
+            return None
+        title_words = set(tokens(main))
+        found = []
+        for volume in body.get("items", []):
+            info, sale = volume.get("volumeInfo", {}), volume.get("saleInfo", {})
+            price = sale.get("retailPrice") or sale.get("listPrice")
+            if sale.get("saleability") != "FOR_SALE" or not price or not price.get("amount"):
+                continue
+            if info.get("language") != self.language or fuzz.token_set_ratio(main.lower(), info.get("title", "").lower()) < 90:
+                continue
+            if surname and not any(surname in tokens(a) for a in info.get("authors", [])):
+                continue
+            if (set(tokens(info.get("title", ""))) & EbayPrices.NOT_THE_BOOK) - title_words:
+                continue
+            found.append({"amount": float(price["amount"]), "currency": price["currencyCode"], "edition_title": info.get("title"),
+                          "url": sale.get("buyLink") or info.get("infoLink"), "retrieved_at": retrieved_at})
+        return found
 
 
-def _replacement(book: dict, provider, home: str, currency: str, rates: Rates, threshold: float) -> dict:
-    """Replacement cost, following the fallback order."""
-    used = {"amount": None, "currency": currency, "source": None, "url": None, "retrieved_at": None,
-            "condition_assumed": None, "reason": "not priced: sent to human appraisal"}
+def ebooks_provider() -> GoogleBooksEbooks | None:
+    key = load_books_key()
+    return GoogleBooksEbooks(key) if key else None
+
+
+def ebook_price(book: dict, provider, home: str, currency: str) -> dict:
+    """The eBook price in the policyholder's own country (no other country, no conversion): a local reference."""
+    empty = {"amount": None, "currency": currency, "edition": "eBook"}
+    if provider is None:
+        return {**empty, "reason": "GOOGLE_BOOKS_API_KEY not set"}
+    found = provider.offers(book["title"], book.get("author", ""), home)
+    if found is None:
+        return {**empty, "reason": "eBook price not looked up: Google Books unavailable (daily quota or an error)"}
+    offers = [o for o in found if o["currency"] == currency]
+    if not offers:
+        return {**empty, "reason": f"no eBook for sale on Google Play in {home}"}
+    median = statistics.median_low(o["amount"] for o in offers)
+    chosen = next(o for o in offers if o["amount"] == median)
+    return {"amount": round(median, 2), "currency": currency, "edition": "eBook", "source": provider.source,
+            "country": home, "converted": False, "url": chosen["url"], "retrieved_at": chosen["retrieved_at"],
+            "edition_title": chosen["edition_title"], "offers_considered": len(offers),
+            "condition_assumed": f"new, eBook edition (Google Play {home}): no eBay site in {home}; median (lower middle) "
+                                 f"of {len(offers)} matching eBook offer(s)"}
+
+
+def price_book(book: dict, home: str, currency: str, rates: Rates, threshold: float, ebay=None, ebooks=None) -> dict:
+    """Replacement cost and used value for one identified book. Replacement cost: eBay new listings
+    where the policyholder's country has an eBay site; elsewhere the country's Google Play eBook price, and
+    eBay new listings from other markets if there is no eBook. Used value: eBay used listings. Books
+    sent to appraisal get neither. threshold is in THRESHOLD_CURRENCY. If eBay could not be reached,
+    the result is marked retry so the job tries again when idle."""
+    threshold = local_threshold(threshold, currency, rates)
+    unpriced = {"amount": None, "currency": currency, "reason": "not priced: sent to human appraisal"}
     year = book.get("first_publish_year")
     if year and year < APPRAISAL_YEAR:
         return {"status": "needs_appraisal", "appraisal_reason": f"first published {year} (antiquarian)",
-                "replacement_cost": None, "used_value": used, "countries_tried": []}
-    if provider is None:
-        return {"status": "identified", "replacement_cost": {"amount": None, "currency": currency,
-                "reason": "GOOGLE_BOOKS_API_KEY not set; no price source available"}, "used_value": used, "countries_tried": []}
-
-    tried = []
-    for country in fallback_countries(home, currency):
-        offers, query = provider.offers(book["title"], book.get("author", ""), country)
-        tried.append(country)
-        if not offers:
-            continue
-        median = statistics.median(o["amount"] for o in offers)
-        chosen = min(offers, key=lambda o: abs(o["amount"] - median))
-        cost = {"amount": chosen["amount"], "currency": chosen["currency"], "source": provider.source,
-                "url": chosen["url"], "retrieved_at": chosen["retrieved_at"], "country": country,
-                "converted": False, "condition_assumed": "new, eBook edition (Google Play)",
-                "language_assumed": getattr(provider, "language", None),
-                "edition_matched": {"title": chosen["edition_title"], "language": chosen["language"], "isbns": chosen["isbns"]},
-                "offers_considered": len(offers), "query": query}
-        if chosen["currency"] != currency:
-            try:
-                amount, rate = rates.convert(chosen["amount"], chosen["currency"], currency)
-            except KeyError as exc:
-                cost.update(amount=None, reason=str(exc))
-                return {"status": "identified", "replacement_cost": cost, "used_value": used, "countries_tried": tried}
-            cost.update(amount=amount, currency=currency, converted=True,
-                        original={"amount": chosen["amount"], "currency": chosen["currency"]},
-                        fx={"rate": round(rate, 6), "date": rates.date, "source": rates.source, "url": rates.url})
-        if cost["amount"] > threshold:
-            return {"status": "needs_appraisal", "appraisal_reason": f"price {cost['amount']} {currency} above "
-                    f"appraisal threshold {threshold} {currency}", "replacement_cost": None, "price_seen": cost,
-                    "used_value": used, "countries_tried": tried}
-        return {"status": "identified", "replacement_cost": cost, "used_value": used, "countries_tried": tried}
-    return {"status": "identified", "replacement_cost": {"amount": None, "currency": currency,
-            "reason": f"no price found in {', '.join(tried)}"}, "used_value": used, "countries_tried": tried}
+                "replacement_cost": None, "used_value": unpriced, "countries_tried": []}
+    ebook_lookup = None
+    if home.upper() not in EbayPrices.MARKETPLACES:      # no eBay site in the policyholder's country: its eBook price first
+        new = ebook_price(book, ebooks, home.upper(), currency)
+        if new["amount"] is None:
+            ebook_lookup = new["reason"]
+            new = {**ebay_value(book, ebay, home, currency, rates, "new"), "instead_of": f"eBook: {ebook_lookup}"}
+    else:
+        new = ebay_value(book, ebay, home, currency, rates, "new")
+    if new["amount"] is not None and new["amount"] > threshold:
+        return {"status": "needs_appraisal", "appraisal_reason": f"price {new['amount']} {currency} above appraisal "
+                f"threshold {threshold} {currency}", "replacement_cost": None, "price_seen": new,
+                "used_value": unpriced, "countries_tried": new.get("countries_tried", [])}
+    used = ebay_value(book, ebay, home, currency, rates, "used")
+    result = {"status": "identified", "replacement_cost": new, "used_value": used, "countries_tried": new.get("countries_tried", [])}
+    if ebook_lookup:
+        result["ebook_lookup"] = ebook_lookup
+    if new.get("lookup_failed") or used.get("lookup_failed"):
+        result["retry"] = True
+    return result
 
 
 def book_totals(priced: list[dict]) -> dict:
@@ -387,17 +379,13 @@ def book_totals(priced: list[dict]) -> dict:
                     "unidentified spines not yet counted"}
 
 
-def price_books(identified: list[dict], home: str, currency: str, rates: Rates, *, threshold: float = 150.0,
-                provider=None, language: str = "en") -> dict:
-    if provider is None:
-        key = load_books_key()
-        provider = GoogleBooksPrices(key, language) if key else None
-    used_provider = ebay_used_prices()
+def price_books(identified: list[dict], home: str, currency: str, rates: Rates, *, threshold: float = 150.0) -> dict:
+    ebay, ebooks = ebay_prices(), ebooks_provider()
     priced = []
     for book in identified:
         priced.append({"id": book["id"], "title": book["title"], "author": book["author"],
                        "frame_ref": book["frame_ref"], "id_confidence": book["id_confidence"],
-                       **price_book(book, provider, home, currency, rates, threshold, used_provider)})
+                       **price_book(book, home, currency, rates, threshold, ebay, ebooks)})
     review = []
     for p in priced:
         cost = p.get("replacement_cost") or {}
@@ -407,9 +395,9 @@ def price_books(identified: list[dict], home: str, currency: str, rates: Rates, 
             review.append({"ref_id": p["id"], "reason": cost.get("reason", "no price")})
         elif cost.get("converted"):
             review.append({"ref_id": p["id"], "reason": f"price converted from {cost['original']['currency']} ({cost['country']})"})
-    return {"country": home.upper(), "currency": currency.upper(), "appraisal_threshold": threshold,
-            "totals": book_totals(priced),
-            "price_source": provider.source if provider else None, "edition_language": language,
-            "used_price_source": used_provider.source if used_provider else None,
+    return {"country": home.upper(), "currency": currency.upper(),
+            "appraisal_threshold": {"amount": local_threshold(threshold, currency, rates), "currency": currency.upper(),
+                                    "set_as": f"{threshold:g} {THRESHOLD_CURRENCY}"},
+            "totals": book_totals(priced), "price_source": ebay.source if ebay else None,
             "fx": {"source": rates.source, "date": rates.date, "url": rates.url},
             "books": priced, "review_queue": review}

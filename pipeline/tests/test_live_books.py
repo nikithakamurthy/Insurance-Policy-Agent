@@ -30,11 +30,11 @@ async def fake_run(agent, frames, country, currency):
     """Stands in for books_agent: frame f00000 shows one book, f00001 that book and another."""
     refs = [f["ref"] for f in frames]
     found = [{**LEAN, "frame_refs": refs}] + ([{**ZERO, "frame_refs": ["f00001"]}] if "f00001" in refs else [])
-    priced = [{"work_key": b["work_key"], **fake_price(b, None, country, currency, None, None)} for b in found] if currency else []
+    priced = [{"work_key": b["work_key"], **fake_price(b, country, currency, None, None)} for b in found] if currency else []
     return {"ocr_lines": {}, "matches": {"by": "fake"}, "verified": {"accepted": found, "suggested": [], "unread": []}, "priced": priced}
 
 
-def fake_price(book, provider, home, currency, rates, threshold, used_provider=None):
+def fake_price(book, home, currency, rates, threshold, ebay=None, ebooks=None):
     return {"status": "identified", "replacement_cost": {"amount": 10.0, "currency": currency, "converted": False},
             "used_value": {"amount": None}}
 
@@ -49,8 +49,7 @@ class BookJobTest(unittest.IsolatedAsyncioTestCase):
         self.patches = [patch.object(live_books, "run_books_agent", fake_run),
                         patch.object(live_books, "create_books_agent", lambda reader, price, known=None: object()),
                         patch.object(live_books, "price_book", fake_price),
-                        patch.object(live_books, "load_books_key", lambda: None),
-                        patch.object(live_books, "ebay_used_prices", lambda: None)]
+                        patch.object(live_books, "ebay_prices", lambda: None)]
         for p in self.patches:
             p.start()
         self.job = live_books.BookJob(self.dir, lambda: None, lambda: None)
@@ -187,6 +186,33 @@ class BookJobTest(unittest.IsolatedAsyncioTestCase):
              "frame_refs": ["f00001"]}], "suggested": [], "unread": []}})
         self.assertEqual(len(self.job.identified), 1)
 
+    def _suggest(self, line):
+        self.job._merge({"matches": {"by": "rules+model"}, "verified": {"accepted": [], "suggested": [line], "unread": []}})
+
+    async def test_suggested_book_confirmed_by_the_policyholder_is_counted_and_marked(self):
+        wander = {**accepted("/works/9", "Invent and Wander", "Jeff Bezos"), "author_hit": False, "frame_refs": ["f00003"]}
+        self._suggest(wander)
+        self.assertEqual(self.job.to_confirm(["f00003"]), ["Invent and Wander by Jeff Bezos"])
+        self.assertEqual(self.job.to_confirm(["f00001"]), [])                       # not read on those frames
+        self.assertEqual(self.job.confirm("invent and wander", True)["status"], "added")
+        line = next(b for b in self.job.lines_out() if b["title"] == "Invent and Wander")
+        self.assertTrue(line["confirmed_by_policyholder"])
+        self.assertEqual(self.job.to_confirm(), [])
+        # A later batch with a longer title must not drop it as a fragment: the policyholder said it is theirs.
+        self.job._merge({"matches": {"by": "rules"}, "verified": {"accepted": [
+            {**accepted("/works/10", "Invent and Wander: The Collected Writings", "Jeff Bezos"), "frame_refs": ["f00005"]}],
+            "suggested": [], "unread": []}})
+        self.assertIn("Invent and Wander", [b["title"] for b in self.job.lines_out()])
+
+    async def test_declined_suggestion_is_dropped_and_not_asked_again(self):
+        garuda = {**accepted("/works/8", "Garuda Purana", "Devdutt Pattanaik"), "author_hit": False, "frame_refs": ["f00004"]}
+        self._suggest(garuda)
+        self.assertEqual(self.job.confirm("Garuda Purana", False)["status"], "declined")
+        self._suggest(garuda)                                                          # suggested again by a later batch
+        self.assertEqual(self.job.to_confirm(), [])
+        self.assertNotIn("Garuda Purana", [b["title"] for b in self.job.lines_out()])
+        self.assertEqual(self.job.confirm("Nonexistent Book", True)["status"], "not_found")
+
     async def test_confirmed_copies_multiply_count_and_total(self):
         self.job.add("f00001", self.dir / "f00001.jpg", "DE", "EUR")     # Lean Startup and Zero to One, 10 EUR each
         await self.drain()
@@ -209,11 +235,11 @@ class BookJobTest(unittest.IsolatedAsyncioTestCase):
     async def test_pricing_failure_leaves_book_unpriced_and_is_retried(self):
         calls = {"n": 0}
 
-        def flaky(*args):
+        def flaky(*args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise OSError("HTTP Error 429: rate limited")
-            return fake_price(*args)
+            return fake_price(*args, **kwargs)
 
         with patch.object(live_books, "price_book", flaky):
             self.job.add("f00000", self.dir / "f00000.jpg", "DE", "")       # identified without a currency

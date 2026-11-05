@@ -39,7 +39,6 @@ class Place:
     label: str
     frame_refs: set = field(default_factory=set)
     work_keys: set = field(default_factory=set)
-    stated_count: int | None = None      # how many books the policyholder says are here
 
 
 class BookPlaces:
@@ -81,16 +80,6 @@ class BookPlaces:
         """Frames shown after the last analysis (for example at the end) belong to the last place."""
         return self.record(self.last.label if self.last else "books not given a place", frame_refs, books_by_frame, titles)
 
-    def set_count(self, label: str, count: int) -> dict:
-        """The policyholder's own count of the books at a place (a rough count is fine). Books the team
-        could not identify are the difference, so the claim's book count covers unreadable spines too."""
-        label = " ".join(label.split()) or (self.last.label if self.last else "books not given a place")
-        key = place_key(label)
-        place = self.places.get(key) or self.places.setdefault(key, Place(key=key, label=label))
-        place.stated_count = count
-        return {"place": place.label, "stated_count": count, "identified_here": len(place.work_keys)}
-
     def summary(self, titles: dict[str, str]) -> dict:
-        return {"places": [{"place": p.label, "books": sorted(titles.get(k, k) for k in p.work_keys), "stated_count": p.stated_count}
-                           for p in self.places.values()],
+        return {"places": [{"place": p.label, "books": sorted(titles.get(k, k) for k in p.work_keys)} for p in self.places.values()],
                 "books_at_places": sum(len(p.work_keys) for p in self.places.values())}

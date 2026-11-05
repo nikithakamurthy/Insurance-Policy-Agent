@@ -60,15 +60,17 @@ def load_api_key() -> str:
                 if match:
                     return match.group(1).strip().strip("\"'")
     raise RuntimeError("GOOGLE_API_KEY is not set (environment, .env, or reference_app/.env)")
-USER_AGENT = "insurance-agent-pipeline/0.1 (contents-claim research prototype)"
+USER_AGENT = "insurance-agent-pipeline/0.1 (home-contents policy research prototype)"
 
 
 def get_cached(url: str, params: dict | None = None, *, max_age_s: float = 7 * 86400, raw: bool = False,
-               cache: bool = True, attempts: int = 3) -> tuple[Any, str]:
+               cache: bool = True, attempts: int = 3, backoff_s: float = 2.0, before_request=None) -> tuple[Any, str]:
     """GET a URL, with an on-disk cache unless cache=False. Returns (body, retrieved_at ISO timestamp).
 
     The retrieval time is the time of the original request, so a cached response keeps the date
-    it was actually seen. Query parameters named 'key' are left out of the cache key.
+    it was actually seen. Query parameters named 'key' are left out of the cache key. A server
+    error (5xx) is retried after backoff_s, 2 x backoff_s, ...; before_request runs before every
+    attempt (to pace calls to one service).
     """
     import hashlib
     import urllib.parse
@@ -85,6 +87,8 @@ def get_cached(url: str, params: dict | None = None, *, max_age_s: float = 7 * 8
 
     request = urllib.request.Request(full, headers={"User-Agent": USER_AGENT})
     for attempt in range(attempts):
+        if before_request:
+            before_request()
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
                 text = response.read().decode("utf-8")
@@ -95,7 +99,7 @@ def get_cached(url: str, params: dict | None = None, *, max_age_s: float = 7 * 8
             # HTTP 4xx are errors in the request itself; retrying will not help.
             if getattr(exc, "code", 500) < 500 or attempt == attempts - 1:
                 raise
-            time.sleep(2 * (attempt + 1))
+            time.sleep(backoff_s * (attempt + 1))
     body = text if raw else json.loads(text)
     retrieved_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     if cache:
@@ -104,10 +108,3 @@ def get_cached(url: str, params: dict | None = None, *, max_age_s: float = 7 * 8
     return body, retrieved_at
 
 
-@contextmanager
-def timed(timings: dict[str, float], stage: str):
-    started = time.perf_counter()
-    try:
-        yield
-    finally:
-        timings[stage] = round(time.perf_counter() - started, 2)

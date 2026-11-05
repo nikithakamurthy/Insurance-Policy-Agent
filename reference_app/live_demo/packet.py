@@ -26,7 +26,7 @@ def _price(price: dict | None, keys: tuple[str, ...]) -> dict:
     out = {k: price.get(k) for k in keys}
     out["amount"] = price.get("amount")
     for extra in ("currency", "country", "condition_assumed", "converted", "original", "fx", "edition_matched", "reason",
-                  "listings_considered"):
+                  "listings_considered", "edition", "edition_title", "instead_of"):
         if price.get(extra) is not None and extra not in out:
             out[extra] = price[extra]
     return out
@@ -62,28 +62,30 @@ def detected_items(detected: dict, logged: list[dict]) -> list[dict]:
     return out
 
 
-ROOM_MIN_WALLS = 2
-ROOM_MIN_CONFIDENCE = 0.5
+ROOM_MIN_FRAMES = 2           # per wall
+ROOM_MAX_SPREAD = 0.15        # a wall's frames may disagree by at most this share of its distance
 
 
-def room_problems(room: dict) -> list[str]:
-    """Why a room measurement is not good enough to report; empty when it is. Below these bars the
-    numbers are mostly guesses (one sweep gave a floor area with no wall found at all), so the
-    packet leaves the room empty rather than report them."""
+def room_problems(measured: dict | None) -> list[str]:
+    """Why the room's length and width are not reported; empty when they are. Below these bars the
+    figures are mostly guesses, so the packet leaves them empty rather than report them."""
+    if not measured:
+        return ["the room step was skipped (no wall measured)"]
+    walls = [w for w in measured.get("walls", []) if w.get("distance_m") is not None]
+    if measured.get("length_m") is None or len(walls) < 2:
+        reasons = sorted({r for w in measured.get("walls", []) for r in w.get("reasons", [])})
+        return [f"{len(walls)} of 2 walls measured" + (f" ({'; '.join(reasons)})" if reasons else "")]
     problems = []
-    if room.get("scale_estimated"):
-        problems.append("scale only estimated by Depth Pro (no bank card in the reconstructed frames)")
-    if not room.get("floor_plane_found"):
-        problems.append("floor not found")
-    if (room.get("walls_found") or 0) < ROOM_MIN_WALLS:
-        problems.append(f"{room.get('walls_found') or 0} wall(s) found, at least {ROOM_MIN_WALLS} needed")
-    if (room.get("confidence") or 0) < ROOM_MIN_CONFIDENCE:
-        problems.append(f"confidence {room.get('confidence')} below {ROOM_MIN_CONFIDENCE}")
+    for w in walls:
+        if w["measured"] < ROOM_MIN_FRAMES:
+            problems.append(f"wall {w['wall']}: only {w['measured']} frame measured, at least {ROOM_MIN_FRAMES} needed")
+        elif (w.get("spread_m") or 0) > ROOM_MAX_SPREAD * w["distance_m"]:
+            problems.append(f"wall {w['wall']}: frames disagree by {w['spread_m']} m")
     return problems
 
 
 def build_packet(meta: dict, items: list[dict], books: dict | None, detected: dict | None = None) -> dict:
-    """meta: sweep_id, captured_at, device, duration_s, country, currency, purpose, purpose_details.
+    """meta: sweep_id, captured_at, device, duration_s, country, currency.
     items: the voice agent's logged objects. books: the worker's GET /books/{sweep}/report, or None.
     detected: object types the live detector confirmed (category -> count, score, frame_ref)."""
     books = books or {}
@@ -92,7 +94,7 @@ def build_packet(meta: dict, items: list[dict], books: dict | None, detected: di
     shelf_by_work = books.get("shelf_by_work", {})
     review: list[dict] = []
 
-    claim_books, excluded = [], []
+    policy_books, excluded = [], []
     for line in books.get("books", []):
         size = sizes.get((line["title"], line.get("author", ""))) or {}
         replacement = line.get("replacement_cost") or {}
@@ -106,24 +108,32 @@ def build_packet(meta: dict, items: list[dict], books: dict | None, detected: di
             "size_method": size.get("scale_method"), "size_estimated": size.get("estimated"),
             "id_confidence": line.get("id_confidence"),
             "copies": line.get("copies", 1), "copies_confirmed": line.get("copies_confirmed", False),
+            "confirmed_by_policyholder": bool(line.get("confirmed_by_policyholder")),
             "replacement_cost": _price(replacement, ("source", "url", "retrieved_at", "converted")),
             "used_value": _price(line.get("used_value"), ("source", "url", "retrieved_at", "condition_assumed")),
         }
         if line.get("excluded"):
             excluded.append({**book, "excluded": line["excluded"]})
             continue
-        claim_books.append(book)
+        policy_books.append(book)
         if book["status"] == "needs_appraisal":
             review.append({"ref_id": book["id"], "reason": f"needs a human appraiser: {line.get('appraisal_reason', '')}".strip(": ")})
         elif replacement.get("amount") is None:
             review.append({"ref_id": book["id"], "reason": f"no price: {replacement.get('reason') or 'price lookup failed'}; excluded from the total"})
+        elif replacement.get("edition") == "eBook":
+            review.append({"ref_id": book["id"], "reason": f"replacement cost is the eBook edition's price (Google Play "
+                                                           f"{replacement.get('country')}, no eBay site there); the printed "
+                                                           "book may cost more"})
         elif replacement.get("converted"):
             review.append({"ref_id": book["id"], "reason": f"price converted from {replacement.get('original', {}).get('currency')} "
                                                            f"({replacement.get('country')})"})
         used = line.get("used_value") or {}
         if used.get("amount") is not None and (used.get("listings_considered") or 0) < 3:
             review.append({"ref_id": book["id"], "reason": f"used value from only {used.get('listings_considered')} eBay listing(s)"})
-        if (book["id_confidence"] or 0) < LOW_ID_CONFIDENCE:
+        if book["confirmed_by_policyholder"]:
+            review.append({"ref_id": book["id"], "reason": "confirmed by the policyholder; the spine was not read clearly "
+                                                           "enough to identify it automatically"})
+        elif (book["id_confidence"] or 0) < LOW_ID_CONFIDENCE:
             review.append({"ref_id": book["id"], "reason": f"identification confidence {book['id_confidence']}"})
         if book["spine_height_cm"] is None and book["spine_thickness_cm"] is None:
             review.append({"ref_id": book["id"], "reason": "spine not measured"})
@@ -131,7 +141,7 @@ def build_packet(meta: dict, items: list[dict], books: dict | None, detected: di
             review.append({"ref_id": book["id"], "reason": "spine size estimated from depth, no bank card in view"})
 
     for copy in books.get("possible_copies", []):
-        match = next((b for b in claim_books if b["title"] == copy["title"]), None)
+        match = next((b for b in policy_books if b["title"] == copy["title"]), None)
         review.append({"ref_id": match["id"] if match else copy["title"],
                        "reason": f"read on {copy['spines_in_one_frame']} spines in one frame; counted once until the policyholder confirms copies"})
     for suggestion in books.get("suggested", []):
@@ -142,12 +152,12 @@ def build_packet(meta: dict, items: list[dict], books: dict | None, detected: di
         review.append({"ref_id": "unread spines", "reason": f"{len(unread)} spine reading(s) matched no catalogue entry; "
                                                              "not counted as books (see unread_spine_readings)"})
 
-    claim_items = []
+    policy_items = []
     for item in list(items) + detected_items(detected or {}, items):
         art = item.get("category") in {"art", "framed_art"}
         said_print = any("print" in n.lower() for n in item.get("notes", []))
         status = "needs_appraisal" if art and not said_print else None      # items are not priced in this version
-        claim_items.append({
+        policy_items.append({
             "id": item["id"], "category": item.get("category"), "description": item["description"],
             "brand_model": item.get("brand_model") or None, "frame_ref": item.get("frame_ref") or None,
             "dimensions_cm": {"w": None, "h": None, "d": None}, "status": status,
@@ -163,68 +173,47 @@ def build_packet(meta: dict, items: list[dict], books: dict | None, detected: di
         if not item.get("frame_ref"):
             review.append({"ref_id": item["id"], "reason": "no camera frame was saved when it was logged"})
 
+    # Room: length and width only, from the corner measurement (Depth Pro + a paper sheet on each of two walls).
+    room = {"length_m": None, "width_m": None, "height_m": None, "floor_area_m2": None, "wall_area_m2": None,
+            "shelved_wall_area_m2": None, "scale_method": None, "confidence": None}
     room_status = books.get("room") or {}
-    measured = room_status.get("room") if room_status.get("state") == "done" else None
-    empty_room = {"length_m": None, "width_m": None, "height_m": None, "floor_area_m2": None, "wall_area_m2": None,
-                  "shelved_wall_area_m2": None, "scale_method": None, "confidence": None}
-    problems = room_problems(measured) if measured else []
-    if measured and not problems:
-        room = {"length_m": measured.get("length_m"), "width_m": measured.get("width_m"), "height_m": measured.get("height_m"),
-                "floor_area_m2": measured.get("floor_area_m2"), "wall_area_m2": measured.get("wall_area_m2"),
-                "shelved_wall_area_m2": measured.get("shelved_wall_area_m2"), "scale_method": measured.get("scale_method"),
-                "confidence": measured.get("confidence"),
-                "floor_area_ft2": measured.get("floor_area_ft2"), "wall_area_ft2": measured.get("wall_area_ft2"),
-                "shape": measured.get("shape"), "shape_method": measured.get("shape_method"),
-                "wall_area_method": measured.get("wall_area_method"),
-                "frames_used": [f"frames/{r}.jpg" if r.startswith("f") else f"room_frames/{r}.jpg" for r in measured.get("frames_used", [])],
-                "floorplan": "floorplan.png"}
-        if measured.get("ceiling_plane_found") is False:
-            # Without a ceiling the height is only the top of what the camera saw; the wall area depends on it.
-            room["height_m"] = room["wall_area_m2"] = room["wall_area_ft2"] = None
-            review.append({"ref_id": "room", "reason": "ceiling not found: height and wall area left empty; "
-                                                       "film a strip of ceiling in the room turn"})
+    measured = room_status.get("room")
+    problems = (["room measurement still running; reload the report"] if room_status.get("state") == "measuring"
+                else room_problems(measured))
+    if problems:
+        review.append({"ref_id": "room", "reason": "room length and width not reported: " + "; ".join(problems)})
     else:
-        room = empty_room
-        if measured:
-            review.append({"ref_id": "room", "reason": "room measurement not reliable, left empty: " + "; ".join(problems)})
-        else:
-            error = room_status.get("error") or ""
-            review.append({"ref_id": "room", "reason": {
-                "running": "room measurement still running; reload the report",
-                "queued": "room measurement still running; reload the report",
-                "failed": ("room not measured: the room turn was skipped or too short" if "room frames" in error
-                           else f"room measurement failed: {error}")}.get(room_status.get("state"), "room not measured")})
-
-    # Books the policyholder counted at a place beyond those identified there: counted, not identified.
-    place_counts = []
-    for place in books.get("place_counts", []):
-        unidentified = max(0, place["stated"] - place["identified"]) if place.get("stated") is not None else 0
-        place_counts.append({**place, "unidentified": unidentified})
-        if unidentified:
-            review.append({"ref_id": place["place"], "reason": f"policyholder counted {place['stated']} books here; "
-                                                              f"{place['identified']} identified, {unidentified} counted but not identified"})
-    unidentified_total = sum(p["unidentified"] for p in place_counts)
+        spreads = [w["spread_m"] / w["distance_m"] for w in measured["walls"] if w.get("spread_m") and w.get("distance_m")]
+        room.update(length_m=measured["length_m"], width_m=measured["width_m"],
+                    floor_area_m2=round(measured["length_m"] * measured["width_m"], 2),
+                    scale_method=measured.get("method"),
+                    confidence=round(max(0.0, 1 - 2 * max(spreads, default=0.0)), 2),
+                    corner_offset_m=measured.get("corner_offset_m"),
+                    walls=[{k: w.get(k) for k in ("wall", "distance_m", "measured", "spread_m")} for w in measured["walls"]],
+                    frames_used=measured.get("frames_used", []))
+        review.append({"ref_id": "room", "reason": "floor area assumes a rectangular room; height, wall area and shelved wall "
+                                                   "area are not measured in this version"})
 
     # Totals, from the lines above only.
     def copies(b: dict) -> int:
         return b["copies"]
 
-    priced = [b for b in claim_books if b["status"] == "identified" and b["replacement_cost"]["amount"] is not None]
-    used = [b for b in claim_books if b["status"] == "identified" and b["used_value"]["amount"] is not None]
-    item_low = [i["replacement_cost"]["low"] for i in claim_items if i["replacement_cost"]["low"] is not None]
-    item_high = [i["replacement_cost"]["high"] for i in claim_items if i["replacement_cost"]["high"] is not None]
-    upright = [b for b in claim_books if b["spine_thickness_cm"]]
+    priced = [b for b in policy_books if b["status"] == "identified" and b["replacement_cost"]["amount"] is not None]
+    used = [b for b in policy_books if b["status"] == "identified" and b["used_value"]["amount"] is not None]
+    item_low = [i["replacement_cost"]["low"] for i in policy_items if i["replacement_cost"]["low"] is not None]
+    item_high = [i["replacement_cost"]["high"] for i in policy_items if i["replacement_cost"]["high"] is not None]
+    upright = [b for b in policy_books if b["spine_thickness_cm"]]
     totals = {
-        "book_count": sum(copies(b) for b in claim_books) + unidentified_total,
-        "books_identified": sum(copies(b) for b in claim_books),
-        "books_unidentified": unidentified_total,     # from the policyholder's count per place; unread spines alone are not counted
+        "book_count": sum(copies(b) for b in policy_books),
+        "books_identified": sum(copies(b) for b in policy_books),
+        "books_unidentified": 0,     # not counted in this version: unread spines are listed, not counted as books
         "shelf_run_m": measurement.get("shelf_run_m") if upright else None,
         "books_replacement_cost": round(sum(b["replacement_cost"]["amount"] * copies(b) for b in priced), 2) if priced else None,
         "books_used_value": round(sum(b["used_value"]["amount"] * copies(b) for b in used), 2) if used else None,
         "items_replacement_cost_low": round(sum(item_low), 2) if item_low else None,
         "items_replacement_cost_high": round(sum(item_high), 2) if item_high else None,
-        "excluded_from_totals": (sum(copies(b) for b in claim_books) - sum(copies(b) for b in priced))
-                                + sum(i["count"] for i in claim_items if i["replacement_cost"]["low"] is None),
+        "excluded_from_totals": (sum(copies(b) for b in policy_books) - sum(copies(b) for b in priced))
+                                + sum(i["count"] for i in policy_items if i["replacement_cost"]["low"] is None),
         "books_left_out_by_policyholder": len(excluded) + len(books.get("pending_exclusions", [])),
         "currency": books.get("currency") or meta.get("currency") or None,
     }
@@ -234,7 +223,7 @@ def build_packet(meta: dict, items: list[dict], books: dict | None, detected: di
         pending.append("reading book spines")
     if (books.get("measurement") or {}).get("state") == "running":
         pending.append("measuring spines")
-    if (books.get("room") or {}).get("state") in {"queued", "running"}:
+    if (books.get("room") or {}).get("state") == "measuring":
         pending.append("measuring the room")
 
     return {
@@ -243,14 +232,12 @@ def build_packet(meta: dict, items: list[dict], books: dict | None, detected: di
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "sweep": {"id": meta.get("sweep_id"), "captured_at": meta.get("captured_at"), "device": meta.get("device") or None,
                   "duration_s": meta.get("duration_s"), "country": meta.get("country") or None,
-                  "currency": books.get("currency") or meta.get("currency") or None,
-                  "purpose": meta.get("purpose") or None, "purpose_details": meta.get("purpose_details") or None},
+                  "currency": books.get("currency") or meta.get("currency") or None},
         "room": room,
-        "books": claim_books,
-        "items": claim_items,
+        "books": policy_books,
+        "items": policy_items,
         "totals": totals,
         "review_queue": review,
-        "place_counts": place_counts,
         "excluded_books": excluded + [{"title": p["title"], "excluded": p, "identified": False}
                                       for p in books.get("pending_exclusions", [])],
         "unread_spine_readings": [{"text": u["text"], "frame_refs": [_frame(r) for r in u["frame_refs"]],

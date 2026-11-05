@@ -9,3 +9,8 @@ _to_delete/
 pipeline/sweep_samples/
 *.mp4
 .DS_Store
+
+# Not part of the live app: evaluation scripts and documentation stay local
+docs/
+pipeline/eval_*.py
+reference_app/assets/

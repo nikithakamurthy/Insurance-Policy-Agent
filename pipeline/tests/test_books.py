@@ -4,8 +4,8 @@ import unittest
 
 from pipeline.catalog import query_text, score_match
 from pipeline.fx import parse_ecb
-from pipeline.pricing import EbayUsedPrices, fallback_countries, price_book
-from pipeline.spine_ocr import group_strips, to_original
+from pipeline.pricing import EbayPrices, fallback_countries, local_threshold, price_book
+from pipeline.spine_ocr import group_strips, keep_best_readings, point_to_original, to_original
 
 ECB_SAMPLE = """<Cube><Cube time='2026-10-30'>
 <Cube currency='USD' rate='1.1172'/><Cube currency='GBP' rate='0.83380'/><Cube currency='INR' rate='106.0840'/>
@@ -39,6 +39,64 @@ class SpineGeometryTest(unittest.TestCase):
         lines = [{"text": "Designing Machine Learning Systems", "box": (0.1, 0.40, 0.7, 0.45)},
                  {"text": "Building a Second Brain", "box": (0.15, 0.43, 0.6, 0.48)}]
         self.assertEqual(len(group_strips(lines)), 2)
+
+
+def _line(text, poly, turn, conf=0.99):
+    return {"text": text, "box": [0, 0, 1, 1], "confidence": conf, "poly": poly, "turn": turn,
+            "word_confidences": [(w, conf) for w in text.split()]}
+
+
+SPINE = [[0.40, 0.10], [0.46, 0.10], [0.46, 0.80], [0.40, 0.80]]
+AUTHOR_END = [[0.40, 0.55], [0.46, 0.55], [0.46, 0.80], [0.40, 0.80]]
+
+
+class KeepBestReadingsTest(unittest.TestCase):
+    def test_points_map_back_like_boxes(self):
+        for orientation in ("top_to_bottom", "bottom_to_top", "upside_down"):
+            x0, y0, x1, y1 = to_original((0.1, 0.2, 0.3, 0.4), orientation)
+            corners = [point_to_original(x, y, orientation) for x, y in ((0.1, 0.2), (0.3, 0.4))]
+            self.assertAlmostEqual(min(c[0] for c in corners), x0)
+            self.assertAlmostEqual(max(c[1] for c in corners), y1)
+
+    def test_reading_seen_upright_wins_over_turned_one(self):
+        kept = keep_best_readings({"top_to_bottom": [_line("Building a Second Brain", SPINE, 0)],
+                                   "bottom_to_top": [_line("Brain Second a Building", SPINE, 180)]})
+        self.assertEqual([l["text"] for ls in kept.values() for l in ls], ["Building a Second Brain"])
+
+    def test_other_reading_kept_when_it_adds_two_words(self):
+        kept = keep_best_readings({"top_to_bottom": [_line("Building a Second", SPINE, 0)],
+                                   "horizontal": [_line("Brain TIAGO FORTE", SPINE, 90)]})
+        self.assertEqual(sum(len(ls) for ls in kept.values()), 2)
+
+    def test_one_new_word_or_unsure_words_are_not_enough(self):
+        kept = keep_best_readings({"top_to_bottom": [_line("Invent Wander", SPINE, 0)],
+                                   "horizontal": [_line("Wander Bezos", SPINE, 90)],
+                                   "upside_down": [_line("Jeff Bezos Writings", SPINE, 180, conf=0.6)]})
+        self.assertEqual([l["text"] for ls in kept.values() for l in ls], ["Invent Wander"])
+
+    def test_texts_in_different_places_are_both_kept(self):
+        apart = [[0.70, 0.10], [0.76, 0.10], [0.76, 0.80], [0.70, 0.80]]
+        kept = keep_best_readings({"top_to_bottom": [_line("Zero to One", SPINE, 0), _line("Zero to One", apart, 0)]})
+        self.assertEqual(len(kept["top_to_bottom"]), 2)
+
+    def test_slanted_lines_group_along_their_slant(self):
+        def slanted(text, start, length, offset):
+            # A line leaning 60 degrees, `offset` across from the first spine, starting `start` along it.
+            u, n = (0.5, -0.866), (0.866, 0.5)
+            x, y = 0.3 + n[0] * offset + u[0] * start, 0.9 + n[1] * offset + u[1] * start
+            ex, ey, nx, ny = u[0] * length, u[1] * length, n[0] * 0.03, n[1] * 0.03
+            poly = [[x, y], [x + ex, y + ey], [x + ex + nx, y + ey + ny], [x + nx, y + ny]]
+            xs, ys = [p[0] for p in poly], [p[1] for p in poly]
+            return {"text": text, "poly": poly, "box": (min(xs), min(ys), max(xs), max(ys))}
+
+        lines = [slanted("Building a Second", 0.0, 0.3, 0.0), slanted("TIAGO FORTE", 0.35, 0.2, 0.0),
+                 slanted("Designing Machine", 0.1, 0.3, 0.06)]
+        self.assertEqual(sorted(sorted(l["text"] for l in s) for s in group_strips(lines)),
+                         [["Building a Second", "TIAGO FORTE"], ["Designing Machine"]])
+
+    def test_lines_without_outline_pass_through(self):
+        old = {"horizontal": [{"text": "THE LEAN STARTUP", "box": [0, 0, 1, 1], "confidence": 0.9}]}
+        self.assertEqual(keep_best_readings(old), old)
 
 
 class MatchScoringTest(unittest.TestCase):
@@ -76,8 +134,31 @@ class MatchScoringTest(unittest.TestCase):
         partial = {"title": "Zero to One Hundred", "author_name": ["Peter Smith"]}
         self.assertFalse(score_match("ZERO to ONE Peter", partial)["accepted"])        # title not fully read
 
-    def test_query_drops_apostrophe_letters_and_publishers(self):
-        self.assertEqual(query_text("The Staff Engineer's Path O'REILLY"), "staff engineers path")
+    def test_query_drops_apostrophe_letters(self):
+        self.assertEqual(query_text("The Staff Engineer's Path O'REILLY"), "staff engineers path oreilly")
+
+    def test_publisher_on_the_spine_is_explained_by_the_result(self):
+        doc = {"title": "Designing Machine Learning Systems", "author_name": ["Chip Huyen"], "publisher": ["O'Reilly Media"]}
+        reading = "Designing Machine Learning Systems Huyen O'REILLY"
+        self.assertEqual(score_match(reading, doc)["explained_fraction"], 1.0)
+        self.assertLess(score_match(reading, {**doc, "publisher": []})["explained_fraction"], 1.0)
+
+    def test_repeated_title_word_is_not_a_distinctive_title(self):
+        self.assertFalse(score_match("OUR SUCCESS", {"title": "Your Success is Our Success", "author_name": []})["accepted"])
+
+    def test_joined_words_must_be_read_in_full(self):
+        # Live sweep: "Second Brain" matched "30-Second Brain" (Anil Seth) through the pair "30second".
+        self.assertFalse(score_match("Second Brain", {"title": "30-Second Brain", "author_name": ["Anil Seth"]})["accepted"])
+        self.assertEqual(score_match("LEON STARTUP ERIC RIES", LEAN)["title_coverage"], 1.0)      # "leonstartup" ~ "leanstartup"
+        self.assertTrue(score_match("PAUL THEROUX ADEADHAND", {"title": "A Dead Hand", "author_name": ["Paul Theroux"]})["accepted"])
+
+    def test_one_word_cannot_be_both_title_and_author(self):
+        # Live sweep: a garbled spine "Lessings istisemme" was accepted as "Lessing" by G. E. Lessing.
+        lessing = {"title": "Lessing", "author_name": ["Gotthold Ephraim Lessing"]}
+        self.assertFalse(score_match("Lessings istisemme", lessing)["author_hit"])
+        self.assertFalse(score_match("Lessings istisemme", lessing)["accepted"])
+        nathan = {"title": "Nathan der Weise", "author_name": ["Gotthold Ephraim Lessing"]}
+        self.assertTrue(score_match("LESSING NATHAN DER WEISE", nathan)["accepted"])
 
     def test_text_from_two_books_is_rejected(self):
         # Most of the reading is unexplained by the title: likely two spines merged.
@@ -95,8 +176,7 @@ class SearchTest(unittest.TestCase):
             self.calls.append(params["q"])
             return ({"items": []} if "googleapis" in url else {"docs": []}), "now"
         for patcher in (mock.patch("pipeline.catalog.get_cached", side_effect=fake_get),
-                        mock.patch("pipeline.pricing.load_books_key", lambda: "test-key"),
-                        mock.patch("pipeline.catalog.correct_spelling", lambda q: q)):
+                        mock.patch("pipeline.pricing.load_books_key", lambda: "test-key")):
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -106,6 +186,11 @@ class SearchTest(unittest.TestCase):
         self.assertEqual(len(self.calls), 1 + MAX_FALLBACK_QUERIES + 1)                # plus one Open Library query
         self.assertEqual(self.calls[1], "systems chip huyen")                       # last spine of a merged reading
         self.assertEqual(self.calls[2], "designing machine learning systems chip")   # then the last word dropped
+
+    def test_publisher_word_at_the_end_is_retried_without(self):
+        from pipeline.catalog import search
+        search("staff engineers path oreilly", limit=10)
+        self.assertEqual(self.calls[1], "staff engineers path")
 
     def test_memo_skips_repeat_queries_within_a_sweep_only(self):
         from pipeline.catalog import search
@@ -136,33 +221,19 @@ class SameWorkTest(unittest.TestCase):
         self.assertTrue(same_work("How to Win Friends and Influence People", "Dale Carnegie",
                                   "How to Win Friends and Influence People by Dale Carnegie", "Dale Carnegie"))
 
+    def test_ampersand_and_bracketed_notes_do_not_split_a_book(self):
+        from pipeline.catalog import same_work
+        self.assertTrue(same_work("How to Win Friends and Influence People", "Dale Carnegie",
+                                  "How to Win Friends & Influence People", "Dale Carnegie"))
+        self.assertTrue(same_work("The Mom Test", "Rob Fitzpatrick", "The MOM Test", "Rob Fitzpatrick (Emprenedor)"))
+        self.assertTrue(same_work("Krieg & Frieden", "Leo Tolstoi", "Krieg und Frieden", "Leo Tolstoi"))   # any language
+        self.assertFalse(same_work("Pride & Prejudice", "Jane Austen", "Pride and Zombies", "Jane Austen"))
+
     def test_sequels_and_other_authors_stay_apart(self):
         from pipeline.catalog import same_work
         self.assertFalse(same_work("Dune", "Frank Herbert", "Dune Messiah", "Frank Herbert"))
         self.assertFalse(same_work("Alone", "Richard D. Logan", "How to Not Die Alone", "Logan Ury"))
         self.assertFalse(same_work("Zero to One", "Peter Thiel", "Zero to One Hundred", "Peter Smith"))
-
-
-class SpellingTest(unittest.TestCase):
-    def test_ocr_slips_and_run_together_words_are_corrected(self):
-        from pipeline.catalog import correct_spelling
-        self.assertEqual(correct_spelling("workng backwrds"), "working backwards")
-        self.assertEqual(correct_spelling("afterthe affair"), "after the affair")
-
-    def test_corrected_query_that_finds_nothing_falls_back_to_the_reading(self):
-        from unittest import mock
-        from pipeline import catalog
-        asked = []
-
-        def fake_search(query, limit, memo=None, open_library=False):
-            asked.append(query)
-            return ([{"key": "gb:x", "title": "Designing Machine Learning Systems", "author_name": ["Chip Huyen"],
-                      "source": "Google Books"}] if "huyen" in query else []), "now"
-        with mock.patch.object(catalog, "correct_spelling", lambda q: q.replace("huyen", "human")), \
-                mock.patch.object(catalog, "_search", side_effect=fake_search):
-            docs, used, _ = catalog.search("Designing Machine Learning Systems Huyen", limit=10)
-        self.assertEqual(asked[:2], ["designing machine learning systems human", "designing machine learning systems huyen"])
-        self.assertEqual(used, "designing machine learning systems huyen")
 
 
 class GoogleBooksSearchTest(unittest.TestCase):
@@ -182,18 +253,26 @@ class GoogleBooksSearchTest(unittest.TestCase):
         self.assertEqual(docs[0]["source"], "Google Books")
 
 
-class FakeProvider:
-    source = "fake"
+def listing(title, value, currency="EUR", condition="Gut"):
+    return {"title": title, "price": {"value": str(value), "currency": currency}, "condition": condition,
+            "itemWebUrl": f"https://www.ebay.de/itm/{abs(hash((title, value))) % 10**6}"}
 
-    def __init__(self, prices):
-        self.prices = prices   # country -> (amount, currency)
 
-    def offers(self, title, author, country):
-        if country not in self.prices:
-            return [], "q"
-        amount, ccy = self.prices[country]
-        return [{"amount": amount, "currency": ccy, "country": country, "edition_title": title, "language": "en",
-                 "isbns": [], "url": f"https://example.test/{country}", "retrieved_at": "2026-11-01"}], "q"
+class FakeEbay(EbayPrices):
+    """The real filtering and median, with the HTTP call replaced: (condition, marketplace) -> listings."""
+
+    def __init__(self, listings):
+        super().__init__("id", "secret")
+        self.listings, self.asked = listings, []
+
+    def _search(self, params, marketplace):
+        self.asked.append(marketplace)
+        key = ("new", marketplace) if "conditionIds:{1000}" in params["filter"] else marketplace
+        return {"itemSummaries": self.listings.get(key, [])}
+
+
+def new_copies(market, price, currency="EUR", title="The Lean Startup Eric Ries"):
+    return FakeEbay({("new", market): [listing(f"{title} neu", price, currency, "Neu")]})
 
 
 class PricingTest(unittest.TestCase):
@@ -209,32 +288,50 @@ class PricingTest(unittest.TestCase):
         self.assertLess(order.index("AT"), order.index("US"))
 
     def test_home_price_is_not_converted(self):
-        result = price_book(self.book, FakeProvider({"DE": (12.99, "EUR")}), "DE", "EUR", RATES, 150)
-        self.assertEqual(result["replacement_cost"]["amount"], 12.99)
-        self.assertFalse(result["replacement_cost"]["converted"])
+        cost = price_book(self.book, "DE", "EUR", RATES, 150, new_copies("EBAY_DE", 12.99))["replacement_cost"]
+        self.assertEqual((cost["amount"], cost["source"]), (12.99, "eBay Browse API (current new listings)"))
+        self.assertFalse(cost["converted"])
 
     def test_same_currency_neighbour_is_used_before_conversion(self):
-        result = price_book(self.book, FakeProvider({"AT": (11.0, "EUR"), "US": (9.0, "USD")}), "DE", "EUR", RATES, 150)
-        self.assertEqual(result["replacement_cost"]["country"], "AT")
-        self.assertFalse(result["replacement_cost"]["converted"])
+        ebay = FakeEbay({("new", "EBAY_AT"): [listing("The Lean Startup Eric Ries", 11.0, condition="Neu")],
+                         ("new", "EBAY_US"): [listing("The Lean Startup Eric Ries", 9.0, "USD", "New")]})
+        cost = price_book(self.book, "DE", "EUR", RATES, 150, ebay)["replacement_cost"]
+        self.assertEqual(cost["country"], "AT")
+        self.assertFalse(cost["converted"])
 
     def test_foreign_price_is_converted_with_ecb_rate(self):
-        result = price_book(self.book, FakeProvider({"US": (11.172, "USD")}), "DE", "EUR", RATES, 150)
-        cost = result["replacement_cost"]
+        cost = price_book(self.book, "DE", "EUR", RATES, 150, new_copies("EBAY_US", 11.17, "USD"))["replacement_cost"]
         self.assertTrue(cost["converted"])
         self.assertAlmostEqual(cost["amount"], 10.0, places=2)
-        self.assertEqual(cost["original"], {"amount": 11.172, "currency": "USD"})
+        self.assertEqual(cost["original"], {"amount": 11.17, "currency": "USD"})
         self.assertEqual(cost["fx"]["date"], "2026-10-30")
 
-    def test_no_price_anywhere_leaves_amount_empty(self):
-        result = price_book(self.book, FakeProvider({}), "DE", "EUR", RATES, 150)
+    def test_no_new_listing_anywhere_leaves_replacement_empty(self):
+        result = price_book(self.book, "DE", "EUR", RATES, 150, FakeEbay({}))
+        self.assertEqual(result["status"], "identified")
         self.assertIsNone(result["replacement_cost"]["amount"])
-        self.assertIn("no price found", result["replacement_cost"]["reason"])
+        self.assertIn("no new listing", result["replacement_cost"]["reason"])
+
+    def test_without_ebay_credentials_nothing_is_priced(self):
+        result = price_book(self.book, "DE", "EUR", RATES, 150, None)
+        self.assertIsNone(result["replacement_cost"]["amount"])
+        self.assertIn("EBAY_CLIENT_ID", result["replacement_cost"]["reason"])
 
     def test_expensive_book_goes_to_appraisal_unpriced(self):
-        result = price_book(self.book, FakeProvider({"DE": (420.0, "EUR")}), "DE", "EUR", RATES, 150)
+        result = price_book(self.book, "DE", "EUR", RATES, 150, new_copies("EBAY_DE", 420.0))
         self.assertEqual(result["status"], "needs_appraisal")
         self.assertIsNone(result["replacement_cost"])
+        self.assertIsNone(result["used_value"]["amount"])
+
+    def test_threshold_is_in_dollars_and_converted(self):
+        # 150 USD is about 14,240 INR at the sample rate: a 1,200 INR book is priced, a 20,000 INR one is not.
+        # India has no eBay site: US listings are converted.
+        cheap = price_book(self.book, "IN", "INR", RATES, 150, new_copies("EBAY_US", 1200 / 106.084 * 1.1172, "USD"))
+        dear = price_book(self.book, "IN", "INR", RATES, 150, new_copies("EBAY_US", 20000 / 106.084 * 1.1172, "USD"))
+        self.assertEqual(cheap["status"], "identified")
+        self.assertEqual(dear["status"], "needs_appraisal")
+        self.assertAlmostEqual(local_threshold(150, "INR", RATES), 150 / 1.1172 * 106.084, delta=0.01)
+        self.assertIn(f"{local_threshold(150, 'INR', RATES)} INR", dear["appraisal_reason"])
 
     def test_totals_add_up_and_exclude_unpriced(self):
         from pipeline.pricing import book_totals
@@ -249,33 +346,7 @@ class PricingTest(unittest.TestCase):
 
     def test_antiquarian_goes_to_appraisal(self):
         old = {**self.book, "first_publish_year": 1851}
-        self.assertEqual(price_book(old, FakeProvider({"DE": (9.0, "EUR")}), "DE", "EUR", RATES, 150)["status"], "needs_appraisal")
-
-
-
-
-def listing(title, value, currency="EUR", condition="Gut"):
-    return {"title": title, "price": {"value": str(value), "currency": currency}, "condition": condition,
-            "itemWebUrl": f"https://www.ebay.de/itm/{abs(hash(title)) % 10**6}"}
-
-
-class FakeEbay(EbayUsedPrices):
-    """The real filtering and median, with the HTTP call replaced: country -> listings."""
-
-    def __init__(self, listings):
-        super().__init__("id", "secret")
-        self.listings, self.asked = listings, []
-
-    def _search(self, params, marketplace):
-        self.asked.append(marketplace)
-        key = ("new", marketplace) if "conditionIds:{1000}" in params["filter"] else marketplace
-        return {"itemSummaries": self.listings.get(key, [])}
-
-
-class QuotaProvider(FakeProvider):
-    def offers(self, title, author, country):
-        from pipeline.pricing import GoogleBooksQuotaError
-        raise GoogleBooksQuotaError("Google Books quota exhausted; pricing paused")
+        self.assertEqual(price_book(old, "DE", "EUR", RATES, 150, new_copies("EBAY_DE", 9.0))["status"], "needs_appraisal")
 
 
 class TraceableEbayPriceTest(unittest.TestCase):
@@ -284,49 +355,18 @@ class TraceableEbayPriceTest(unittest.TestCase):
         prices = [3.12, 6.0, 7.99, 11.24, 15.0, 20.0]
         ebay = FakeEbay({"EBAY_US": [listing(f"The Lean Startup Eric Ries copy {i}", p, "USD") for i, p in enumerate(prices)]})
         used = price_book({"title": "The Lean Startup", "author": "Eric Ries", "first_publish_year": 2011},
-                          FakeProvider({}), "US", "USD", RATES, 150, ebay)["used_value"]
+                          "US", "USD", RATES, 150, ebay)["used_value"]
         self.assertEqual(used["amount"], 7.99)
         linked = next(l for l in used["listings"] if l["url"] == used["url"])
         self.assertEqual(linked["amount"], 7.99)
         self.assertEqual([l["amount"] for l in used["listings"]], prices)
 
 
-class ReplacementFallbackTest(unittest.TestCase):
-    book = {"title": "The Manager's Path", "author": "Camille Fournier", "first_publish_year": 2017}
-    used = [listing("The Manager's Path Camille Fournier", 18.0)]
-    new = [listing("The Manager's Path - Camille Fournier - neu", 30.0, condition="Neu"),
-           listing("Camille Fournier The Manager's Path O'Reilly", 32.0, condition="Neu")]
-
-    def test_google_quota_falls_back_to_new_copies_on_ebay_and_still_prices_used(self):
-        ebay = FakeEbay({"EBAY_DE": self.used, ("new", "EBAY_DE"): self.new})
-        result = price_book(self.book, QuotaProvider({}), "DE", "EUR", RATES, 150, ebay)
-        self.assertEqual((result["replacement_cost"]["amount"], result["replacement_cost"]["source"]),
-                         (30.0, "eBay Browse API (current new listings)"))
-        self.assertNotIn("retry_replacement", result)
-        self.assertEqual(result["used_value"]["amount"], 18.0)
-
-    def test_quota_without_new_listings_is_retried_later_and_used_still_priced(self):
-        result = price_book(self.book, QuotaProvider({}), "DE", "EUR", RATES, 150, FakeEbay({"EBAY_DE": self.used}))
-        self.assertIsNone(result["replacement_cost"]["amount"])
-        self.assertTrue(result["retry_replacement"])
-        self.assertEqual(result["used_value"]["amount"], 18.0)
-
-    def test_new_copies_on_ebay_come_before_the_ebook_price(self):
-        result = price_book(self.book, FakeProvider({"DE": (12.99, "EUR")}), "DE", "EUR", RATES, 150,
-                            FakeEbay({("new", "EBAY_DE"): self.new}))
-        self.assertEqual(result["replacement_cost"]["amount"], 30.0)
-
-    def test_without_new_listings_the_ebook_price_is_used_and_says_why(self):
-        result = price_book(self.book, FakeProvider({"DE": (12.99, "EUR")}), "DE", "EUR", RATES, 150, FakeEbay({}))
-        self.assertEqual(result["replacement_cost"]["amount"], 12.99)
-        self.assertIn("no new listing", result["replacement_cost"]["instead_of"])
-
-
 class UsedValueTest(unittest.TestCase):
     book = {"title": "Zero to One", "author": "Peter Thiel", "first_publish_year": 2014}
 
     def price(self, ebay, home="DE", currency="EUR"):
-        return price_book(self.book, FakeProvider({home: (12.99, currency)}), home, currency, RATES, 150, ebay)
+        return price_book(self.book, home, currency, RATES, 150, ebay)
 
     def test_median_of_matching_used_listings(self):
         ebay = FakeEbay({"EBAY_DE": [listing("Zero to One - Peter Thiel - Taschenbuch", 6.0),
@@ -353,17 +393,19 @@ class UsedValueTest(unittest.TestCase):
         self.assertIsNone(used["amount"])
         self.assertIn("no used listing", used["reason"])
 
-    def test_ebay_failure_leaves_only_used_value_empty(self):
+    def test_ebay_failure_is_marked_for_retry(self):
         class Down(FakeEbay):
             def _search(self, params, marketplace):
                 raise OSError("eBay unreachable")
         result = self.price(Down({}))
-        self.assertEqual(result["replacement_cost"]["amount"], 12.99)
+        self.assertIsNone(result["replacement_cost"]["amount"])
         self.assertIsNone(result["used_value"]["amount"])
+        self.assertTrue(result["retry"])
 
     def test_appraisal_books_get_no_used_value(self):
-        ebay = FakeEbay({"EBAY_DE": [listing("Zero to One Peter Thiel", 900.0)]})
-        result = price_book(self.book, FakeProvider({"DE": (420.0, "EUR")}), "DE", "EUR", RATES, 150, ebay)
+        ebay = FakeEbay({"EBAY_DE": [listing("Zero to One Peter Thiel", 900.0)],
+                         ("new", "EBAY_DE"): [listing("Zero to One Peter Thiel", 420.0, condition="Neu")]})
+        result = self.price(ebay)
         self.assertEqual(result["status"], "needs_appraisal")
         self.assertIsNone(result["used_value"]["amount"])
 
@@ -381,21 +423,10 @@ class GoogleBooksQuotaTest(unittest.TestCase):
         return urllib.error.HTTPError("https://www.googleapis.com/books/v1/volumes", code, "error", {},
                                       io.BytesIO(json.dumps({"error": {"message": message}}).encode()))
 
-    def test_daily_quota_fails_fast_and_pauses_for_an_hour(self):
-        from unittest import mock
-        calls = []
-
-        def fake_get(*args, **kwargs):
-            calls.append(1)
-            raise self.http_error(429, "Quota exceeded for quota metric 'Queries' and limit 'Queries per day'")
-        provider = self.pricing.GoogleBooksPrices("k")
-        with mock.patch("pipeline.pricing.get_cached", side_effect=fake_get), mock.patch("time.sleep") as slept:
-            with self.assertRaises(self.pricing.GoogleBooksQuotaError):
-                provider.offers("Zero to One", "Peter Thiel", "DE")
-            with self.assertRaises(self.pricing.GoogleBooksQuotaError):
-                provider.offers("Zero to One", "Peter Thiel", "AT")     # paused: no request at all
-        self.assertEqual(len(calls), 1)
-        self.assertFalse(any(c.args and c.args[0] >= 1 for c in slept.call_args_list))   # no retry waits
+    def test_daily_quota_pauses_search_for_an_hour(self):
+        message = "Quota exceeded for quota metric 'Queries' and limit 'Queries per day'"
+        self.assertTrue(self.pricing.note_google_books_error(self.http_error(429, message), message))
+        self.assertTrue(self.pricing.google_books_paused())
         self.assertGreater(self.pricing._google_books_paused_until - time.time(), 3000)
 
     def test_other_errors_do_not_pause(self):
@@ -415,3 +446,66 @@ class GoogleBooksQuotaTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EbookReferenceTest(unittest.TestCase):
+    book = {"title": "How to Win Friends and Influence People", "author": "Dale Carnegie", "first_publish_year": 1936}
+
+    class Ebooks:
+        source = "Google Books API (Google Play eBook)"
+
+        def __init__(self, offers):
+            self.offers_by_country, self.asked = offers, []
+
+        def offers(self, title, author, country):
+            self.asked.append(country)
+            return self.offers_by_country.get(country, [])
+
+    def ebook(self, amount):
+        return {"amount": amount, "currency": "INR", "edition_title": "How to Win Friends", "url": "https://play.google.com/x",
+                "retrieved_at": "2026-11-04"}
+
+    PRINTED = "How to Win Friends and Influence People Dale Carnegie"
+
+    def test_country_with_ebay_uses_ebay_and_never_asks_for_an_ebook(self):
+        ebooks = self.Ebooks({"DE": [self.ebook(9.99)]})
+        result = price_book(self.book, "DE", "EUR", RATES, 150, new_copies("EBAY_DE", 12.0, "EUR", self.PRINTED), ebooks)
+        self.assertEqual(result["replacement_cost"]["amount"], 12.0)
+        self.assertNotEqual(result["replacement_cost"].get("edition"), "eBook")
+        self.assertEqual(ebooks.asked, [])
+
+    def test_country_without_ebay_uses_its_ebook_price_labelled_as_ebook(self):
+        from pipeline.pricing import book_totals
+        ebooks = self.Ebooks({"IN": [self.ebook(250.0)]})
+        result = price_book(self.book, "IN", "INR", RATES, 150, new_copies("EBAY_US", 14.99, "USD", self.PRINTED), ebooks)
+        cost = result["replacement_cost"]
+        self.assertEqual((cost["amount"], cost["edition"], cost["country"], cost["converted"]), (250.0, "eBook", "IN", False))
+        self.assertEqual(ebooks.asked, ["IN"])
+        self.assertEqual(book_totals([result])["books_replacement_cost"], 250.0)
+
+    def test_no_ebook_falls_back_to_other_ebay_markets_and_says_why(self):
+        result = price_book(self.book, "IN", "INR", RATES, 150, new_copies("EBAY_US", 14.99, "USD", self.PRINTED), self.Ebooks({}))
+        cost = result["replacement_cost"]
+        self.assertEqual((cost["country"], cost["converted"]), ("US", True))
+        self.assertIn("no eBook for sale on Google Play in IN", cost["instead_of"])
+        self.assertIn("no eBook", result["ebook_lookup"])
+
+    def test_google_books_unavailable_falls_back_too(self):
+        down = self.Ebooks({})
+        down.offers = lambda title, author, country: None
+        result = price_book(self.book, "IN", "INR", RATES, 150, new_copies("EBAY_US", 14.99, "USD", self.PRINTED), down)
+        self.assertEqual(result["replacement_cost"]["country"], "US")
+        self.assertIn("not looked up", result["ebook_lookup"])
+
+    def test_summaries_and_other_authors_are_not_the_book(self):
+        from unittest import mock
+        from pipeline import pricing
+        items = [{"volumeInfo": {"title": t, "authors": a, "language": "en"},
+                  "saleInfo": {"saleability": "FOR_SALE", "retailPrice": {"amount": p, "currencyCode": "INR"}, "buyLink": "u"}}
+                 for t, a, p in [("The Lean Startup", ["Eric Ries"], 499.0),
+                                 ("The Lean Startup: Summary", ["Eric Ries"], 99.0),
+                                 ("Lessons Inspired by The Lean Startup", ["Someone Else"], 115.0)]]
+        with mock.patch.object(pricing, "get_cached", return_value=({"items": items}, "2026-11-04")), \
+                mock.patch.object(pricing, "pace_google_books", lambda: None):
+            found = pricing.GoogleBooksEbooks("k").offers("The Lean Startup", "Eric Ries", "IN")
+        self.assertEqual([o["amount"] for o in found], [499.0])

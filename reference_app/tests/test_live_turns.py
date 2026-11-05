@@ -62,7 +62,7 @@ class LiveTurnTests(unittest.IsolatedAsyncioTestCase):
             return Connection()
         fake = NS(aio=NS(live=NS(connect=connect)))
         with patch.object(s, '_has_api_key', return_value=True), \
-             patch.object(s, '_live_client', return_value=fake), \
+             patch.object(s, '_client', return_value=fake), \
              patch.object(s, 'VISION_URL', ''):
             await asyncio.wait_for(s.live_voice(WS()), 2)
         self.assertEqual(bool(configurations[0].history_config), bool(initial))
@@ -91,7 +91,7 @@ class LiveTurnTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual([t['text'] for t in session.transcript],
                          ['Let me explain', 'Stop.', 'Okay, I will wait.'])
-        self.assertFalse(any(m['type'] == 'avatar_video' for m in sent))
+        self.assertFalse(any(m['type'] == 'audio' for m in sent))
         stopped = next(i for i, m in enumerate(sent) if m['type'] == 'interrupted')
         final = next(i for i, m in enumerate(sent) if m['type'] == 'transcript' and m['final'])
         self.assertLess(stopped, final)
@@ -104,22 +104,19 @@ class LiveTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context[0]['turns'][0].role, 'model')
         self.assertEqual(context[0]['turns'][0].parts[0].text, greeting)
 
-    def test_voice_and_avatar_allow_speech_to_interrupt(self):
-        for name in ['', 'Kira']:
-            config = build_live_config(avatar_name=name)
-            self.assertEqual(config.realtime_input_config.activity_handling.value,
-                             'START_OF_ACTIVITY_INTERRUPTS')
+    def test_speech_can_interrupt_the_agent(self):
+        config = build_live_config()
+        self.assertEqual(config.realtime_input_config.activity_handling.value, 'START_OF_ACTIVITY_INTERRUPTS')
+        self.assertEqual(config.response_modalities, ['AUDIO'])
 
-    def test_name_hints_apply_to_input_only_in_voice_and_avatar_calls(self):
+    def test_name_hints_apply_to_input_only(self):
         with patch.dict(os.environ, {'FNOL_TRANSCRIPTION_VOCABULARY': ' Maya Chen, Chen, ,Chen '}):
-            for name in ['', 'Kira']:
-                config = build_live_config(avatar_name=name)
-                self.assertEqual(config.input_audio_transcription.custom_vocabulary,
-                                 ['Maya Chen', 'Chen'])
-                self.assertIsNone(config.output_audio_transcription.custom_vocabulary)
-                self.assertNotIn('Maya Chen', config.system_instruction)
+            config = build_live_config()
+            self.assertEqual(config.input_audio_transcription.custom_vocabulary, ['Maya Chen', 'Chen'])
+            self.assertIsNone(config.output_audio_transcription.custom_vocabulary)
+            self.assertNotIn('Maya Chen', config.system_instruction)
 
-    async def test_idle_avatar_frames_do_not_split_spoken_claimant_turn(self):
+    async def test_non_audio_media_is_ignored(self):
         video = NS(parts=[NS(inline_data=NS(data=b'idle frame', mime_type='video/mp4'))])
         session, sent, _ = await self.run_events([
             event(input_transcription=words('My name is ')),
@@ -127,7 +124,7 @@ class LiveTurnTests(unittest.IsolatedAsyncioTestCase):
             event(input_transcription=words('Maya Chen.', True)),
         ])
         self.assertEqual([t['text'] for t in session.transcript], ['My name is Maya Chen.'])
-        self.assertEqual(len([m for m in sent if m['type'] == 'avatar_video']), 1)
+        self.assertFalse(any(m['type'] in {'audio', 'avatar_video'} for m in sent))
 
     def test_no_name_is_assumed_without_vocabulary(self):
         with patch.dict(os.environ, {'FNOL_TRANSCRIPTION_VOCABULARY': ''}):
